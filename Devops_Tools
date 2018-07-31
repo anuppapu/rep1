@@ -7,3 +7,7 @@ E> Artifactory
 F> Nexus
 
 Above are SCM Tools
+Continuous Integration Tools
+1> Jenkins
+2> Bamboo
+3> AWS Code Build
