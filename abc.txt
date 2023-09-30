@@ -1,28 +1,15 @@
-2023-09-28 22:43:40,670 - ERROR    - Exception occurred while processing request: 'NoneType' object is not iterable
-Traceback (most recent call last):
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 119, in _handle_exceptions
-    return func(*args, **kwargs)
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 2840, in get_data
-    curr_dtypes = [c["name"] for c in global_state.get_dtypes(data_id)]
-TypeError: 'NoneType' object is not iterable
-2023-09-28 22:44:27,028 - ERROR    - Exception occurred while processing request: 'NoneType' object is not iterable
-Traceback (most recent call last):
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 119, in _handle_exceptions
-    return func(*args, **kwargs)
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 2840, in get_data
-    curr_dtypes = [c["name"] for c in global_state.get_dtypes(data_id)]
-TypeError: 'NoneType' object is not iterable
-2023-09-28 22:44:29,695 - ERROR    - Exception occurred while processing request: 'NoneType' object is not iterable
-Traceback (most recent call last):
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 119, in _handle_exceptions
-    return func(*args, **kwargs)
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 2840, in get_data
-    curr_dtypes = [c["name"] for c in global_state.get_dtypes(data_id)]
-TypeError: 'NoneType' object is not iterable
-2023-09-28 22:44:31,157 - ERROR    - Exception occurred while processing request: 'NoneType' object is not iterable
-Traceback (most recent call last):
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 119, in _handle_exceptions
-    return func(*args, **kwargs)
-  File "c:\users\dasan\rasa_nlu\rasanlu\lib\site-packages\dtale\views.py", line 2840, in get_data
-    curr_dtypes = [c["name"] for c in global_state.get_dtypes(data_id)]
-TypeError: 'NoneType' object is not iterable
+import polars as pl
+
+# Read the CSV file into a Polars DataFrame
+df = pl.read_csv('your_data.csv')
+
+# Define the dynamic query parameters (you can customize these)
+group_by_column = 'category'  # Column to group by
+aggregate_column = 'value'    # Column to perform aggregation on (e.g., 'sum', 'mean', 'max', etc.)
+aggregate_function = 'sum'    # Aggregation function to apply
+
+# Perform the dynamic query
+result_df = df.groupby(group_by_column).agg(pl.col(aggregate_column).agg(aggregate_function))
+
+# Show the result DataFrame
+print(result_df)
