@@ -8,8 +8,11 @@ group_by_column = 'category'  # Column to group by
 aggregate_column = 'value'    # Column to perform aggregation on (e.g., 'sum', 'mean', 'max', etc.)
 aggregate_function = 'sum'    # Aggregation function to apply
 
+# Create an aggregation expression
+agg_expr = df[aggregate_column].agg(aggregate_function).alias('result')
+
 # Perform the dynamic query
-result_df = df.groupby(group_by_column).agg(pl.col(aggregate_column).agg(aggregate_function))
+result_df = df.groupby(group_by_column).agg(agg_expr)
 
 # Show the result DataFrame
 print(result_df)
