@@ -70,6 +70,38 @@ Give public access to the Bucket and add Bucket policies
             "Action": "s3:GetObject",
             "Resource": "arn:aws:s3:::s3bot/*"    ---- Add ?* after the ARN to give access all the objects in the bucket.
         }
+==========================================
+class ActionCreateBarPlot(Action):
+    def name(self) -> Text:
+        return "action_get_barplot"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        
+        # Sample DataFrame
+        data = {
+            'Category': ['A', 'B', 'C', 'D'],
+            'Values': [10, 25, 15, 30]
+        }
+
+        df = pd.DataFrame(data)
+
+        # Create a bar chart using the DataFrame
+        plt.figure(figsize=(8, 6))
+        plt.bar(df['Category'], df['Values'])
+        plt.xlabel('Category')
+        plt.ylabel('Values')
+        plt.title('Bar Chart')
+
+        # Save the chart as an image
+        image_path = 'C:\\Users\\91888\\Desktop\\bar_chart.png'
+        plt.savefig(image_path)
+
+        # Close the plot to release resources
+        plt.close()
+        dispatcher.utter_message(image=image_path)
+        return []
     ]
 }
 ------------------------
