@@ -1,0 +1,76 @@
+# Class to create a Bar Plot
+
+class ActionCreateBarPlot(Action):
+    def name(self) -> Text:
+        return "action_get_barplot"
+
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        
+        # Example data (you can replace this with data from slots or other sources)
+        categories = ['Category A', 'Category B', 'Category C']
+        values = [30, 45, 20]
+        
+        # Create the bar plot
+        sns.set(style="whitegrid")
+        plt.figure(figsize=(8, 6))
+        sns.barplot(x=values, y=categories)
+        plt.xlabel("Values")
+        plt.ylabel("Categories")
+        plt.title("Bar Plot Example")
+
+        # Save the plot to a BytesIO object
+        plot_buffer = BytesIO()
+        plt.savefig(plot_buffer, format='png')
+        plot_buffer.seek(0)
+        plt.close()
+
+        # AWS S3 credentials and bucket details
+        aws_access_key = "AKIARZL3FAI3ZN6MOQWP"
+        aws_secret_key = "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"
+        bucket_name = "s3bot"
+        object_key = "bar_plot.png"
+        
+        # Upload the plot to S3 bucket
+        s3_client = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
+        s3_client.upload_fileobj(plot_buffer, bucket_name, object_key)
+
+        # Generate the S3 URL for the uploaded plot
+        s3_url = f"https://{bucket_name}.s3.amazonaws.com/{object_key}"
+        
+        # Send the plot link as an utterance response
+        dispatcher.utter_message(text=f"Here's the [bar plot]({s3_url}).")
+        
+        return []
+
+----------------------------------------------
+Custom Actions (actions.py)
+pip3 install rasa-core-sdk
+
+Build a Chatbot with Kern refinery and Rasa NLU
+how to generate url for graph image
+
+Create a IAM user(s3user) - Provided AmazonS3FullAccess. Generate Access key
+access key - AKIARZL3FAI3ZN6MOQWP
+secret access key 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
+s3user
+-----------------------
+Create a s3 bucket
+s3bot
+Give public access to the Bucket and add Bucket policies  
+{
+    "Version": "2012-10-17",
+    "Id": "Policy1692384047072",
+    "Statement": [
+        {
+            "Sid": "Stmt1692384043578",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::s3bot/*"    ---- Add ?* after the ARN to give access all the objects in the bucket.
+        }
+    ]
+}
+------------------------
+    
