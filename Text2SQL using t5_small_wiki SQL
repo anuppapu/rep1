@@ -1,0 +1,56 @@
+Spark NLP documentation and instructions:
+https://nlp.johnsnowlabs.com/docs/en/quickstart
+
+Spark NLP Google T5 Article
+https://towardsdatascience.com/hands-on-googles-text-to-text-transfer-transformer-t5-with-spark-nlp-6f7db75cecff
+
+For T5 models:
+https://nlp.johnsnowlabs.com/models?q=T5
+
+You can find details about Spark NLP models here:
+https://nlp.johnsnowlabs.com/models
+
+1. Colab Setup
+    # Install PySpark and Spark NLP
+    ! pip install -q pyspark==3.3.0 spark-nlp==4.2.8
+2. Start the Spark session
+    import json
+    import pandas as pd
+    import numpy as np
+    
+    import sparknlp
+    import pyspark.sql.functions as F
+    
+    from pyspark.ml import Pipeline
+    from pyspark.sql import SparkSession
+    from sparknlp.annotator import *
+    from sparknlp.base import *
+    from sparknlp.pretrained import PretrainedPipeline
+    from pyspark.sql.types import StringType, IntegerType
+
+3. spark = sparknlp.start()
+   print ("Spark NLP Version :", sparknlp.version())
+   spark
+4. Choose a sample text
+    text_list = ["""which client TASKCOMMON is set as 'activate'?""",
+             """How many players were with the school or club team La Salle?""",
+             """When the scoring rank was 117, what was the best finish?""",
+             """When the best finish was T69, how many people came in 2nd?""",
+             """How many wins were there when the money list rank was 183?""",
+             """When did the Metrostars have their first Rookie of the Year winner?""",
+             """What college did the Rookie of the Year from the Columbus Crew attend?"""]
+
+5. documentAssembler = DocumentAssembler() \
+      .setInputCol("text") \
+      .setOutputCol("documents")
+   t5 = T5Transformer.pretrained("t5_small_wikiSQL") \
+      .setTask("translate English to SQL:") \
+      .setInputCols(["documents"]) \
+      .setMaxOutputLength(200) \
+      .setOutputCol("sql")
+  pipeline = Pipeline().setStages([documentAssembler, t5])
+
+6. df = spark.createDataFrame(text_list, StringType()).toDF("text")
+  result = pipeline.fit(df).transform(df)
+
+7. result.select("text","sql.result").show(truncate=False)
