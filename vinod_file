@@ -1,0 +1,176 @@
+const util = require('util');
+const path = require('path');
+const fs = require('fs');
+var MongoClient = require('mongodb').MongoClient;
+
+var mongo_url = "mongodb://localhost:27017/"
+
+const res = require('express/lib/response');
+const { exit } = require("process");
+
+
+var getCount = function(dbName,collectionName) {
+
+    var dbCount = 0;
+
+    var promise = new Promise(function(resolve, reject) {
+
+        MongoClient.connect(mongo_url, function(err, db) {
+
+            if (err) {
+                console.log('Unable to connect to server', err);
+            } else {
+                console.log('Database connection established:' + dbName);
+            }
+            var dbo = db.db(dbName);
+            // Get the collection
+            var col = dbo.collection(collectionName);
+
+            col.count({}, function(err, count) {
+                if (err) console.log(err);
+                db.close();
+                console.log('docs count: ' + count);
+                resolve(null);
+                dbCount = count;
+            });
+
+        });
+
+    });
+
+    promise.then(function() {
+        return dbCount;
+    });
+    
+};
+
+
+function getRows(dbName,collectionName,query,limit,skip) {
+    var results=[];
+    MongoClient.connect(mongo_url, function(err, db) {
+
+        if (err) {
+            console.log('Unable to connect to server', err);
+        } else {
+            console.log('Database connection established:' + dbName);
+        }
+        var dbo = db.db(dbName);
+        // Get the collection
+        var col = dbo.collection(collectionName);
+
+        col.find(query).limit(limit).skip(skip).toArray(function(err, result){
+            if (err) console.log(err);
+            db.close();
+            get_change_data(result);
+            if (result.length>0){
+                skip=skip+limit;
+                getRows(dbName,collectionName,query,limit,skip);
+            } else {
+
+                console.log("Rows : "+dataset.length);
+                
+                try {
+                    const datasetFolder = path.join("C:\\Files", 'change_times.json');
+                    console.log("File written to "+datasetFolder);
+                    fs.writeFileSync(datasetFolder, JSON.stringify(dataset));
+                } catch (e) {
+                    console.log("Failed to write file ")
+                    console.log(e);
+                }
+
+            }
+            
+            //return result;
+            
+        });
+
+    });
+
+
+    
+};
+
+var dataset=[];
+
+
+function get_change_data(result){
+    result.forEach((item)=>{
+        var log_times={};
+        log_times.key=item.key;
+        log_times.client=item.client;
+        log_times.team=item.team;
+        log_times.issuetype=item.issuetype;
+        log_times.summary=item.summary;
+        log_times.current_status=item.status;
+        if (item.created){
+            log_times.Created = new Date(item.created);
+        }
+        
+        var status_list = ["To Do","Open","Analyzing","Awaiting Client Feedback","Backlog","Implementing","Ready For Packaging"];
+        
+        status_list.forEach((item)=>{
+            log_times["days_"+item]=0;
+        });
+        
+        log_times["days_total"]=0;
+        var previous_change = new Date(item.created);
+
+        if (item.changelog && item.status!=="Cancelled"){
+            item.changelog.histories.forEach((change)=>{
+                change.items.forEach((change_item)=>{
+                    if (change_item.field=="status"){
+
+                        var new_date = new Date(change.created);
+                        var time_diff = (new_date - previous_change)/ (24*60*60*1000);
+                        previous_change = new_date;
+                        log_times["days_"+change_item.fromString] = log_times["days_"+change_item.fromString] + time_diff;
+                        log_times["days_total"] = log_times["days_total"] + time_diff;
+                     
+                        if (change_item.toString=="Analyzing"){
+                            if (!log_times.Analyzing){
+                                log_times.Analyzing = new Date(change.created);
+                                log_times.OpenAnalyzing = ((log_times.Analyzing - log_times.Created)/(24*60*60*1000)).toFixed(2);
+                            }
+                        }
+                        if (change_item.toString=="Backlog"){
+                            if (!log_times.Backlog){
+                                log_times.Backlog = new Date(change.created);
+                                log_times.OpenBacklog = ((log_times.Backlog - log_times.Created)/(24*60*60*1000)).toFixed(2);
+                            }
+
+                        }
+                        if (change_item.toString=="Done"){
+                            if (!log_times.Done){
+                                log_times.Done = new Date(change.created);
+                                log_times.OpenDone = ((log_times.Done - log_times.Created)/(24*60*60*1000)).toFixed(2);
+                            }
+
+                        }
+
+                    }
+
+                });
+            });
+
+        }
+
+        var now = new Date();
+        var time_diff = (now - previous_change)/ (24*60*60*1000);
+        log_times["days_"+item.status] = log_times["days_"+item.status] + time_diff;
+
+
+        if (item.status!=="Cancelled" && (item.issuetype=="Feature" || item.issuetype=="Story" || item.issuetype=="Bug")){
+            dataset.push(log_times);
+        }
+        
+    });
+  
+
+}
+
+
+getRows("JIRA","jira",{project : "IPE"},5000,0);
+
+
+
+
