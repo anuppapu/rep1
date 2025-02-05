@@ -1,0 +1,361 @@
+import os
+import streamlit as st
+import pdfplumber
+import re
+import logging
+import time
+from datetime import datetime
+import pandas as pd
+from unidecode import unidecode
+import PyPDF2
+
+# Configure logging to write to a file with separation between entries
+logging.basicConfig(
+    filename=os.path.join(os.getcwd(), 'bookmark_cloning_tool.log'),
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    filemode='a'
+)
+
+# Set page config
+st.set_page_config(page_title="Sentry Contract Bookmark Cloning Tool", page_icon="BRLogo.png")
+
+# Hide deploy button and footer
+hide_streamlit_style = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+</style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
+# Add Page Banner
+st.markdown(
+    """
+    <style>
+    .banner {
+        background-color: #f8f9fa;
+        padding: 10px;
+        text-align: center;
+        border-bottom: 2px solid #ddd;
+    }
+    .banner h1 {
+        color: #333;
+        margin: 0;
+        font-size: 2.5em;
+    }
+    .banner p {
+        color: #666;
+        font-size: 1.2em;
+    }
+    </style>
+    <div class="banner">
+        <h2>Sentry Contract Bookmark Cloning Tool</h2>
+        <p>Unlock Smooth Bookmark Synchronization for Contract Documents</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+def log_message(log_area, logs, message):
+    """Add message to logs with timestamp"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted_message = f"[{timestamp}] {message}"
+    logs.append(formatted_message)
+    logging.info(message)
+    log_area.markdown(f"<div style='color:blue;'><pre>{formatted_message}</pre></div>", unsafe_allow_html=True)
+
+def clean_bookmark(bookmark):
+    """Remove starting and ending quotes and specified ending symbols."""
+    unwanted_chars = '“”‘’"\':'
+    
+    # Normalize apostrophes
+    bookmark = bookmark.replace('’', "'").replace('‘', "'")
+    
+    bookmark = bookmark.strip(unwanted_chars)
+    ending_symbols = ['"):', '")']
+    
+    for symbol in ending_symbols:
+        if bookmark.endswith(symbol):
+            bookmark = bookmark[:-len(symbol)].rstrip('”"')
+    
+    return bookmark
+
+def extract_bookmarks(pdf_path):
+    """Extract bookmarks from a PDF file using PyPDF2."""
+    try:
+        with open(pdf_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            bookmarks = []
+            try:
+                outline = pdf_reader.outline
+                def extract_bookmark_titles(outline_item):
+                    bookmarks_list = []
+                    for item in outline_item:
+                        if isinstance(item, list):
+                            bookmarks_list.extend(extract_bookmark_titles(item))
+                        elif isinstance(item, dict):
+                            title = item.get('/Title', '')
+                            cleaned_title = clean_bookmark(title)
+                            bookmarks_list.append(cleaned_title)
+                    return bookmarks_list
+                bookmarks = extract_bookmark_titles(outline)
+            except Exception as e:
+                st.warning(f"Could not extract bookmarks: {e}")
+        return bookmarks
+    except Exception as e:
+        st.error(f"Error reading PDF file: {e}")
+        return []
+
+# def clean_text(text):
+#     """Clean and normalize text."""
+#     text = unidecode(text)
+#     text = text.replace('’', '').replace("'", "")
+#     text = re.sub(r'[^\x20-\x7E]+', ' ', text)
+#     return re.sub(r'\s+', ' ', text).strip().lower()
+
+def clean_text(text):
+    """Clean and normalize text without removing whitespace characters."""
+    text = unidecode(text)
+    
+    # Normalize apostrophes
+    text = text.replace('’', "'").replace('‘', "'")
+    
+    text = re.sub(r'[^\x20-\x7E]+', '', text)  # Remove only non-ASCII printable characters without replacing with a space
+    return text.strip().lower()  # Trim leading and trailing spaces, and convert to lowercase
+
+def prepare_variations(bookmark):
+    """Prepare variations of the bookmark for searching."""
+    bookmark = bookmark.lower()
+    return [
+        f'"{bookmark}":',
+        f'"{bookmark}"'
+    ]
+
+def cache_cleaned_text(pdf_path):
+    """Cache and clean the whole text of a PDF once."""
+    cleaned_pages = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            cleaned_pages.append(clean_text(page_text))
+    return cleaned_pages
+
+# def cache_cleaned_text(pdf_path):
+#     """Cache and clean the whole text of a PDF once."""
+#     cleaned_pages = []
+#     with pdfplumber.open(pdf_path) as pdf:
+#         for i, page in enumerate(pdf.pages):
+#             page_text = page.extract_text() or ""
+#             cleaned_text = clean_text(page_text)
+#             cleaned_pages.append(cleaned_text)
+            
+#             # Debug print for pages 3 and 4
+#             if i == 9 or i == 10:
+#                 print(f"Cleaned text of page {i + 1}:\n{cleaned_text}\n{'-' * 40}")
+
+#     return cleaned_pages
+
+def search_bookmark_in_pdf(cleaned_pages, bookmark):
+    """Search for bookmark in already cleaned PDF pages and return matching pages."""
+    variations = prepare_variations(bookmark)
+    for priority_variation in variations:
+        matching_pages = [
+            page_num for page_num, page_text in enumerate(cleaned_pages)
+            if priority_variation in page_text
+        ]
+        if matching_pages:
+            return matching_pages[:2]  # Stop at the first successful variation
+    return []
+
+def add_bookmark_to_pdf(source_pdf_path, target_pdf_path, bookmarks_mapping):
+    """Add bookmarks to PDF and save as new file."""
+    try:
+        with open(source_pdf_path, 'rb') as source_file, open(target_pdf_path, 'rb') as target_file:
+            pdf_writer = PyPDF2.PdfWriter()
+            pdf_reader_target = PyPDF2.PdfReader(target_file)
+            for page in pdf_reader_target.pages:
+                pdf_writer.add_page(page)
+            for bookmark, page_num in bookmarks_mapping.items():
+                #pdf_writer.add_outline_item(bookmark, page_num + 1)  # PyPDF2 is 0-indexed
+                pdf_writer.add_outline_item(bookmark, page_num)  # PyPDF2 is 0-indexed
+            output_path = target_pdf_path.replace('.pdf', '_with_bookmarks.pdf')
+            with open(output_path, 'wb') as output_file:
+                pdf_writer.write(output_file)
+            return output_path
+    except Exception as e:
+        st.error(f"Error adding bookmarks to PDF: {e}")
+        return None
+
+def initialize_session_state():
+    """Initialize all session state variables."""
+    session_vars = {
+        'source_pdf': None,
+        'target_pdf': None,
+        'bookmarks': [],
+        'unique_bookmarks': [],
+        'processed': False,
+        'processed_bookmarks': {},
+        'skipped_bookmarks': [],
+        'skipped_multiple': [],
+        'skipped_not_found': [],
+        'output_pdf': None,
+        'stats_df': None,
+        'start_time': None,
+        'end_time': None,
+        'logs': [],
+        'log_text': ""
+    }
+    
+    for var, default in session_vars.items():
+        if var not in st.session_state:
+            st.session_state[var] = default
+
+def main():
+    initialize_session_state()
+
+    st.write("\n")
+    source_pdf = st.file_uploader("Upload Source PDF", type=['pdf'])
+    st.write("\n")
+    target_pdf = st.file_uploader("Upload Target PDF", type=['pdf'])
+    
+    if source_pdf and target_pdf:
+        st.session_state.source_pdf = source_pdf
+        st.session_state.target_pdf = target_pdf
+        
+        with open("source_temp.pdf", "wb") as f:
+            f.write(st.session_state.source_pdf.getbuffer())
+        
+        st.session_state.bookmarks = extract_bookmarks("source_temp.pdf")
+        
+        if st.session_state.bookmarks:
+            st.subheader("Source PDF Bookmarks")
+            bookmark_text = "\n".join(st.session_state.bookmarks)
+            st.text_area("Bookmarks", value=bookmark_text, height=200)
+            
+            if not st.session_state.processed:
+                st.session_state.unique_bookmarks = list(set(st.session_state.bookmarks))
+            
+            st.info(f"Number of unique bookmarks: {len(st.session_state.unique_bookmarks)}")
+            
+            if st.button("Clone Bookmarks"):
+                with st.spinner("Cloning bookmarks is in progress. Please wait, it could take a few minutes..."):
+                    # Process bookmarks
+                    process_bookmarks()
+
+    # Display results if processing is complete
+    if st.session_state.processed:
+        display_results()
+
+def process_bookmarks():
+    """Process bookmarks and store results in session state."""
+    st.session_state.start_time = time.time()
+    logs = []
+    log_area = st.expander("View Logs", expanded=False)
+    
+    with open("target_temp.pdf", "wb") as f:
+        f.write(st.session_state.target_pdf.getbuffer())
+    #############
+    #os.startfile("target_temp.pdf")
+    #############
+    # Cache cleaned text of the target PDF
+    cleaned_pages = cache_cleaned_text("target_temp.pdf")
+    
+    # Reset processing results
+    st.session_state.processed_bookmarks = {}
+    st.session_state.skipped_bookmarks = []
+    st.session_state.skipped_multiple = []
+    st.session_state.skipped_not_found = []
+    
+    total_bookmarks = len(st.session_state.bookmarks)
+    for idx, bookmark in enumerate(st.session_state.bookmarks, 1):
+        progress = (idx / total_bookmarks) * 100
+        log_message(log_area, logs, f"Processing bookmark ({idx}/{total_bookmarks}) - {bookmark}")
+
+        matching_pages = search_bookmark_in_pdf(cleaned_pages, bookmark)
+
+        if len(matching_pages) == 1:
+            st.session_state.processed_bookmarks[bookmark] = matching_pages[0]
+            log_message(log_area, logs, f"✓ Found '{bookmark}' on page {matching_pages[0] + 1}")
+        else:
+            st.session_state.skipped_bookmarks.append(bookmark)
+            if len(matching_pages) > 1:
+                st.session_state.skipped_multiple.append(bookmark)
+                log_message(log_area, logs, f"⚠ Skipped '{bookmark}' - found on multiple pages")
+            else:
+                st.session_state.skipped_not_found.append(bookmark)
+                log_message(log_area, logs, f"✗ Skipped '{bookmark}' - not found")
+
+    st.session_state.output_pdf = add_bookmark_to_pdf(
+        "source_temp.pdf", 
+        "target_temp.pdf", 
+        st.session_state.processed_bookmarks
+    )
+
+    st.session_state.stats_df = pd.DataFrame({
+        "Category": ["Skipped (Multiple Pages)", "Not Found"],
+        "Count": [len(st.session_state.skipped_multiple), len(st.session_state.skipped_not_found)],
+        "Bookmarks": [', '.join(st.session_state.skipped_multiple), ', '.join(st.session_state.skipped_not_found)]
+    })
+
+    st.session_state.end_time = time.time()
+    st.session_state.processed = True
+
+def display_results():
+    """Display processing results and download button."""
+    elapsed_time = st.session_state.end_time - st.session_state.start_time
+    minutes, seconds = divmod(elapsed_time, 60)
+
+    st.info("Bookmark cloning process completed")
+
+    # Display timestamps
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        start_formatted = datetime.fromtimestamp(st.session_state.start_time).strftime('%Y-%m-%d %H:%M:%S')
+        st.info(f"Start: {start_formatted}")
+    with col2:
+        end_formatted = datetime.fromtimestamp(st.session_state.end_time).strftime('%Y-%m-%d %H:%M:%S')
+        st.info(f"End: {end_formatted}")
+    with col3:
+        st.info(f"Duration: {int(minutes)}m {seconds:.1f}s")
+
+    st.subheader("Bookmark Cloning Results")
+
+    # Display statistics
+    unique_bookmarks = set(st.session_state.bookmarks)
+    unique_processed = set(st.session_state.processed_bookmarks.keys())
+    unique_skipped = set(st.session_state.skipped_bookmarks)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.info(f"Total Bookmarks: {len(unique_bookmarks)}")
+    with col2:
+        st.info(f"Processed: {len(unique_processed)}")
+    with col3:
+        st.info(f"Skipped: {len(unique_skipped)}")
+
+    # Display skipped bookmarks
+    if st.session_state.skipped_bookmarks:
+        st.text_area("Skipped Bookmarks", value="\n".join(st.session_state.skipped_bookmarks), height=100)
+        st.dataframe(st.session_state.stats_df)
+
+    # Download button
+    if st.session_state.output_pdf:
+        default_filename = "New_Indenture_with_bookmarks.pdf"
+        user_input_filename = st.text_input("Enter the file name for the output PDF", value=default_filename)
+
+        if not user_input_filename.endswith('.pdf'):
+            user_input_filename += '.pdf'
+
+        with open(st.session_state.output_pdf, 'rb') as f:
+            st.download_button(
+                label="Download New PDF Indenture with Bookmarks",
+                data=f.read(),
+                file_name=user_input_filename,
+                mime='application/pdf'
+            )
+
+if __name__ == "__main__":
+    main()
