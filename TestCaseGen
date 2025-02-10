@@ -1,0 +1,309 @@
+import os
+import pandas as pd
+import zipfile
+import xml.etree.ElementTree as ET
+import pythoncom
+import win32com.client
+from PyPDF2 import PdfReader
+import requests
+import json
+import re
+ 
+class DocumentExtractor:
+    def __init__(self):
+        pass
+    
+    def extract_doc_content(self, file_extension, uploaded_file):
+       
+        try:
+            if file_extension == 'docx':
+                return self.extract_docx_content(uploaded_file)
+            elif file_extension == 'doc':
+                return self.extract_legacy_doc_content(uploaded_file)
+            elif file_extension == 'pdf':
+                return self.extract_pdf_content(uploaded_file)
+            else:
+                print(f"Unsupported file type: {file_extension}")
+                return []
+        except Exception as e:
+            print(f"Document extraction error: {e}")
+            return []
+ 
+    def extract_docx_content(self, docx_file_path):
+        try:
+           
+            content_chunks = []
+ 
+            with zipfile.ZipFile(docx_file_path) as zf:
+                xml_content = zf.read('word/document.xml')
+                root = ET.fromstring(xml_content)
+                namespace = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+ 
+                paragraphs = []
+                current_heading = "Document Content"
+               
+                for paragraph in root.findall('.//w:p', namespace):
+                    style = paragraph.find('.//w:pStyle', namespace)
+                    if style is not None:
+                        style_val = style.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val')
+                        if style_val and 'Heading' in style_val:
+                            if paragraphs:
+                                content_chunks.append({
+                                    'heading': current_heading,
+                                    'text': '\n'.join(paragraphs)
+                                })
+                                paragraphs = []
+                            current_heading = self.extract_paragraph_text(paragraph, namespace)
+                   
+                    para_text = self.extract_paragraph_text(paragraph, namespace)
+                    if para_text.strip():
+                        paragraphs.append(para_text)
+               
+                if paragraphs:
+                    content_chunks.append({
+                        'heading': current_heading,
+                        'text': '\n'.join(paragraphs)
+                    })
+           
+            return content_chunks
+        except Exception as e:
+            print(f"DOCX extraction error: {e}")
+            return []
+ 
+    def extract_paragraph_text(self, paragraph, namespace):
+        texts = []
+        for text_element in paragraph.findall('.//w:t', namespace):
+            if text_element.text:
+                texts.append(text_element.text)
+        return ' '.join(texts)
+ 
+    def extract_legacy_doc_content(self, doc_file_path):
+        try:
+           
+            extraction_methods = [
+                self.extract_with_win32com,
+                self.extract_with_python_docx
+            ]
+           
+            for method in extraction_methods:
+                try:
+                    content = method(doc_file_path)
+                    if content:
+                        os.unlink(doc_file_path)
+                        return [{'heading': 'Document Content', 'text': content}]
+                except Exception as e:
+                    print(f"Extraction method failed: {method.__name__} - {e}")
+           
+            os.unlink(doc_file_path)
+            print("Unable to extract content from DOC file")
+            return []
+       
+        except Exception as e:
+            print(f"Legacy DOC extraction error: {e}")
+            return []
+ 
+    def extract_with_win32com(self, file_path):
+        try:
+            pythoncom.CoInitialize()
+            word = win32com.client.Dispatch("Word.Application")
+            doc = word.Documents.Open(file_path)
+            text = doc.Content.Text
+            doc.Close()
+            word.Quit()
+            pythoncom.CoUninitialize()
+            return text
+        except Exception as e:
+            print(f"Win32com extraction failed: {e}")
+            raise
+ 
+    def extract_with_python_docx(self, file_path):
+        try:
+            from docx import Document
+            doc = Document(file_path)
+            return '\n'.join([para.text for para in doc.paragraphs if para.text])
+        except Exception as e:
+            print(f"Python-docx extraction failed: {e}")
+            raise
+ 
+    
+    def extract_pdf_content(self, pdf_file_path):
+        try:
+
+ 
+            reader = PdfReader(pdf_file_path)
+            text = []
+            for page in reader.pages:
+                text.append(page.extract_text())
+ 
+            return [{'heading': 'Document Content', 'text': '\n'.join(text)}]
+        except Exception as e:
+            print(f"PDF extraction error: {e}")
+            return []
+ 
+    def clean_and_format_text(self, text):
+        try:
+            prompt = f"""
+            You are a professional document cleaner and formatter. Your task is to clean and enhance the readability of the provided text. This includes, but is not limited to:
+ 
+            - Correcting any formatting errors (e.g., inconsistent fonts, sizes, or styles).
+            - Removing unnecessary whitespace, redundant spaces, and empty lines.
+            - Reomve the Table of Contents and Text before to Table of Contents.
+            - Eliminating unwanted headings, subheadings, or table of contents sections unless they are essential to the text’s structure.
+            - Fixing paragraph alignment, indentation, and spacing for improved readability.
+            - Remove if there is "Document Sign-off" heading and it's content available in the text.
+            - Do not include the Appendix. like "Appendix A:"
+            - Ensuring the text flows smoothly, preserving its original meaning and structure.
+ 
+            Please clean, format, and organize the following text while maintaining its clarity, coherence, and original content:
+ 
+            {text}
+            """
+           
+            endpoint_url = "https://broadgpt-sandbox-us-east-1-brs.enbgai.dev.npd.bfsaws.net/v1/chat/completions"
+            api_key = "eyJ0eXAiOiJKV1QiLCJraWQiOiIzZWNiNjU3My1kYTU2LTQ5NDYtOGEwMi1hOTRhNjEzNzMyYmQiLCJhbGciOiJFUzI1NiIsImlzcyI6Imh0dHBzOi8vY29nbml0by1pZHAudXMtZWFzdC0xLmFtYXpvbmF3cy5jb20vdXMtZWFzdC0xX0E2empKZ0pmdyIsImNsaWVudCI6IjdkZHU1YTh0ODI4MG0zNzBxNTZvNm10cXFwIiwic2lnbmVyIjoiYXJuOmF3czplbGFzdGljbG9hZGJhbGFuY2luZzp1cy1lYXN0LTE6MTcxODU5MDg0MDk0OmxvYWRiYWxhbmNlci9hcHAvZGV2LWVuYmdhaWJycy1lY3NsYi1hbGIvYTUyMjM0MjM3MWRjNGNkNiIsImV4cCI6MTcyMzE0Mzc0OH0=.eyJjdXN0b206YWRncm91cHMiOiJEZXZlbG9wbWVudCIsInN1YiI6IjZmNzFkNTEwLTNkOTctNGNjNi1hMThkLTA3N2FlY2VmMDAwMSIsImFkZHJlc3MiOiJIeWRlcmFiYWQiLCJlbWFpbF92ZXJpZmllZCI6ImZhbHNlIiwicHJvZmlsZSI6IlRlY2hub2xvZ3kgU3BlY2lhbGlzdCIsInByZWZlcnJlZF91c2VybmFtZSI6ImZiYTA5NzMzLWEwNTgtNDcxOC05M2E1LWE0MzdiZWZlZDNlYSIsImdpdmVuX25hbWUiOiJBbnVwIiwiaWRlbnRpdGllcyI6Ilt7XCJ1c2VySWRcIjpcIkFudXAuRGFzQGJyb2FkcmlkZ2UuY29tXCIsXCJwcm92aWRlck5hbWVcIjpcIkJyb2FkR1BUQXp1cmVBRFwiLFwicHJvdmlkZXJUeXBlXCI6XCJTQU1MXCIsXCJpc3N1ZXJcIjpcImh0dHBzOi8vc3RzLndpbmRvd3MubmV0L2EzMTk4YzhjLTA2NDItNDY0OS04NDlkLWRhYWNjMzI5OGY4My9cIixcInByaW1hcnlcIjp0cnVlLFwiZGF0ZUNyZWF0ZWRcIjoxNzEyMDU4NjQzNzM4fV0iLCJjdXN0b206RGVwYXJ0bWVudCI6IkdUT19DTV9Db252ZXJzaW9ucyIsIm5hbWUiOiJBbnVwLkRhc0Bicm9hZHJpZGdlLmNvbSIsIm5pY2tuYW1lIjoiR1RPX0NNX0NvbnZlcnNpb25zIiwiY3VzdG9tOkpvYlRpdGxlIjoiVGVjaG5vbG9neSBTcGVjaWFsaXN0IiwiZmFtaWx5X25hbWUiOiJEYXMiLCJlbWFpbCI6IkFudXAuRGFzQGJyb2FkcmlkZ2UuY29tIiwidXNlcm5hbWUiOiJicm9hZGdwdGF6dXJlYWRfYW51cC5kYXNAYnJvYWRyaWRnZS5jb20iLCJleHAiOjE3MzA5MTk3NDgsImlzcyI6Imh0dHBzOi8vY29nbml0by1pZHAudXMtZWFzdC0xLmFtYXpvbmF3cy5jb20vdXMtZWFzdC0xX0E2empKZ0pmdyJ9.jZHH79m1gSERKqm-md8Qs8s-GLKZFyaadkT3_Vz9jktr37t-ozj5ysb6HocQlneAY6b_BnVGBT92WZoVjqR9gw=="
+ 
+            headers = {
+                "Content-Type": "application/json",
+                "applicationType": "Developer",
+                "Authorization": f"Bearer {api_key}"
+            }
+            data = {
+                "messages": [{"role": "user", "content": prompt}],
+                "model": "gpt-4o",
+                "max_tokens": 4000,
+                "temperature": 0
+            }
+ 
+            response = requests.post(endpoint_url, json=data, headers=headers)
+ 
+            if response.status_code == 200:
+                result = response.json()["choices"][0]["message"]["content"].strip()
+                return result
+            else:
+                print(f"Error clearing text: {response.text}")
+                return ""
+ 
+        except Exception as e:
+            print(f"Error in cleaning text: {e}")
+            return text
+ 
+    def generate_test_case_prompt(self, requirements):
+        testcase_data = pd.read_csv("testcase.csv")
+        # Filter the DataFrame where 'Product Impact' is 'DTC Settlement'
+        filtered_data = testcase_data[testcase_data['Product'] == 'Impact']
+        sub_data = filtered_data[filtered_data['Sub Product'] == 'DTC Settlement']
+        
+        testcase_data = sub_data        
+        output_format = """
+        {
+        "Test Case Number": "Unique numerical identifier for the test case",
+        "FRD Section": "The section holding the requirements a test case covers",
+        "Detailed Test Description": "A thorough description of the scenario being tested",
+        "Detailed Expected Result": "The expected outcome if the scenario behaves correctly",
+        "Testing Steps": "A clear, step-by-step guide for executing the test case",
+        "Priority": "High/Medium/Low"
+        }
+        """
+
+        prompt = f"""
+        You are a dedicated QA Analyst responsible for developing a robust suite of test cases, including regression and unit test scenarios.                                                                                                                                                                               TASK: Generate as many test cases as possible, ensuring coverage of regression test scenarios and unit test scenarios along with all possible conditions and edge cases. Develop these test cases following the pattern in the given SAMPLE TEST CASES, addressing the following categories:
+        
+        TASK: Generate as many test cases as possible, ensuring coverage of regression test scenarios and unit test scenarios along with all possible conditions and edge cases. 
+        Develop these test cases following the pattern in the given SAMPLE TEST CASES, addressing the following categories:
+        
+        SAMPLE TESTCASES : {testcase_data}
+        
+        REQUIREMENTS SPECIFICATION:
+        {requirements}
+
+        1. **Positive Test Cases**: Testing with valid input and expected behavior
+        2. **Negative Test Cases**: Testing with invalid or unexpected input
+        3. **Boundary Value Analysis**: Testing values just inside and outside valid boundaries
+
+        For each test case, provide:
+
+        - **Test Case Number**: A unique numerical identifier for the test case
+        - **FRD Section**: The section of the requirements document that this test case corresponds to
+        - **Detailed Test Description**: A description of the test scenario being tested
+        - **Detailed Expected Result**: What should happen when the test case is executed correctly
+        - **Testing Steps**: A step-by-step guide for executing the test case
+        - **Priority**: High, Medium, or Low, based on the importance of the test case
+
+        Ensure test cases:
+        - Cover both typical and failure scenarios
+        - Address all risk areas in the requirements document
+        - Include boundary and edge cases, performance, security, usability, and error handling
+        - Provide clear and detailed instructions for execution
+        - Are exhaustive and cover all aspects of the system
+
+        **OUTPUT FORMAT**:
+        {output_format}
+        
+        Your goal is to generate a comprehensive set of test cases that cover all aspects of the requirements document and the given sample testcase data. Generate twenty to thirty number of test cases.
+        """
+        return prompt
+    
+    def clean_json_response(self, json_data_str):
+        # Extract the JSON data between ```json and ```
+        cleaned_json_data_str = re.search(r'```json(.*?)```', json_data_str, re.DOTALL).group(1)
+        print(cleaned_json_data_str)
+        # Parse the cleaned JSON string into a Python object
+        json_data = json.loads(cleaned_json_data_str)
+
+        # Convert the JSON data to DataFrame
+        df = pd.json_normalize(json_data)
+
+        # Sort the DataFrame based on the index in ascending order
+        df_sorted = df.sort_index(ascending=True)
+
+        return df_sorted  
+      
+    def generate_testcases(self, prompt):
+        try:
+            endpoint_url = "https://broadgpt-sandbox-us-east-1-brs.enbgai.dev.npd.bfsaws.net/v1/chat/completions"
+            api_key = "eyJ0eXAiOiJKV1QiLCJraWQiOiIzZWNiNjU3My1kYTU2LTQ5NDYtOGEwMi1hOTRhNjEzNzMyYmQiLCJhbGciOiJFUzI1NiIsImlzcyI6Imh0dHBzOi8vY29nbml0by1pZHAudXMtZWFzdC0xLmFtYXpvbmF3cy5jb20vdXMtZWFzdC0xX0E2empKZ0pmdyIsImNsaWVudCI6IjdkZHU1YTh0ODI4MG0zNzBxNTZvNm10cXFwIiwic2lnbmVyIjoiYXJuOmF3czplbGFzdGljbG9hZGJhbGFuY2luZzp1cy1lYXN0LTE6MTcxODU5MDg0MDk0OmxvYWRiYWxhbmNlci9hcHAvZGV2LWVuYmdhaWJycy1lY3NsYi1hbGIvYTUyMjM0MjM3MWRjNGNkNiIsImV4cCI6MTcyMzE0Mzc0OH0=.eyJjdXN0b206YWRncm91cHMiOiJEZXZlbG9wbWVudCIsInN1YiI6IjZmNzFkNTEwLTNkOTctNGNjNi1hMThkLTA3N2FlY2VmMDAwMSIsImFkZHJlc3MiOiJIeWRlcmFiYWQiLCJlbWFpbF92ZXJpZmllZCI6ImZhbHNlIiwicHJvZmlsZSI6IlRlY2hub2xvZ3kgU3BlY2lhbGlzdCIsInByZWZlcnJlZF91c2VybmFtZSI6ImZiYTA5NzMzLWEwNTgtNDcxOC05M2E1LWE0MzdiZWZlZDNlYSIsImdpdmVuX25hbWUiOiJBbnVwIiwiaWRlbnRpdGllcyI6Ilt7XCJ1c2VySWRcIjpcIkFudXAuRGFzQGJyb2FkcmlkZ2UuY29tXCIsXCJwcm92aWRlck5hbWVcIjpcIkJyb2FkR1BUQXp1cmVBRFwiLFwicHJvdmlkZXJUeXBlXCI6XCJTQU1MXCIsXCJpc3N1ZXJcIjpcImh0dHBzOi8vc3RzLndpbmRvd3MubmV0L2EzMTk4YzhjLTA2NDItNDY0OS04NDlkLWRhYWNjMzI5OGY4My9cIixcInByaW1hcnlcIjp0cnVlLFwiZGF0ZUNyZWF0ZWRcIjoxNzEyMDU4NjQzNzM4fV0iLCJjdXN0b206RGVwYXJ0bWVudCI6IkdUT19DTV9Db252ZXJzaW9ucyIsIm5hbWUiOiJBbnVwLkRhc0Bicm9hZHJpZGdlLmNvbSIsIm5pY2tuYW1lIjoiR1RPX0NNX0NvbnZlcnNpb25zIiwiY3VzdG9tOkpvYlRpdGxlIjoiVGVjaG5vbG9neSBTcGVjaWFsaXN0IiwiZmFtaWx5X25hbWUiOiJEYXMiLCJlbWFpbCI6IkFudXAuRGFzQGJyb2FkcmlkZ2UuY29tIiwidXNlcm5hbWUiOiJicm9hZGdwdGF6dXJlYWRfYW51cC5kYXNAYnJvYWRyaWRnZS5jb20iLCJleHAiOjE3MzA5MTk3NDgsImlzcyI6Imh0dHBzOi8vY29nbml0by1pZHAudXMtZWFzdC0xLmFtYXpvbmF3cy5jb20vdXMtZWFzdC0xX0E2empKZ0pmdyJ9.jZHH79m1gSERKqm-md8Qs8s-GLKZFyaadkT3_Vz9jktr37t-ozj5ysb6HocQlneAY6b_BnVGBT92WZoVjqR9gw=="
+ 
+            headers = {
+                "Content-Type": "application/json",
+                "applicationType": "Developer",
+                "Authorization": f"Bearer {api_key}"
+            }
+            data = {
+                "messages": [{"role": "user", "content": prompt}],
+                "model": "gpt-4o",
+                "max_tokens": 10000,
+                "temperature": 0
+            }
+ 
+            response = requests.post(endpoint_url, json=data, headers=headers)
+ 
+            if response.status_code == 200:
+                result = response.json()["choices"][0]["message"]["content"].strip()
+                print("result", result)
+                testcase_df = self.clean_json_response(result)
+                print("testcase_df", testcase_df)
+                return testcase_df
+            
+            else:
+                print(f"Error generating test cases: {response.text}")
+                return ""
+        except Exception as e:
+            print(f"Error generating test cases: {e}")
+            return ""
+ 
+    def exract_content_from_doc(self, file_extension, uploaded_file):
+
+        extracted_content = self.extract_doc_content(file_extension, uploaded_file)
+
+        full_text = "\n\n".join([section['text'] for section in extracted_content])
+
+        cleaned_text = self.clean_and_format_text(full_text)
+
+        return cleaned_text
+
+    def get_test_cases(self, cleaned_text):
+
+        test_case_prompt = self.generate_test_case_prompt(cleaned_text)
+        test_cases_df = self.generate_testcases(test_case_prompt)
+
+        return test_cases_df
