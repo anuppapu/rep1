@@ -1,0 +1,200 @@
+Add below functionalities in the below code and provide the updated code. Do not change anything in the below code just add the new functionalities
+ 
+1. Add 2 buttons after extracted_df data frame as "PROD Setup" and "UAT Setup", beside to each other.
+2. If user clicks "PROD Setup" button then Check extracted_df data frame "Description" column values in a loop and retrieve it’s corresponding "Client Response (PRD)" column values, 
+        if the “Description” column value is “Connectivity Type (s)” and it's corresponding "Client Response (PRD)" column values is "VPN” then check word VPN exist in table_names list, if yes retrieve the Table name from table_names list.
+
+if the “Description” column value is “Primary for SFTP” or “Primary for MQ” or “Primary for NDM” and if it's corresponding "Client Response (PRD)" column values are not blank then then check word SFTP, MQ, NDM respectively exists in table_names list, if yes retrieve the Table name from table_names list.
+
+Display all the consolidated table names in a drop down list and load the table based on the user selection from the lis.
+
+3.  If user clicks "UAT Setup" button then Check extracted_df data frame "Description" column values in a loop and retrieve it’s corresponding "Client Response (UAT)" column values, 
+        if the “Description” column value is “Connectivity Type (s)” and it's corresponding "Client Response (UAT)" column values is "VPN” then check word VPN exist in table_names list, if yes retrieve the Table name from table_names list.
+
+if the “Description” column value is “Primary for SFTP” or “Primary for MQ” or “Primary for NDM” and if it's corresponding "Client Response (PRD)" column values are not blank then then check word SFTP, MQ, NDM respectively exists in table_names list, if yes retrieve the Table name from table_names list.
+
+Display all the consolidated table names in a drop down list and load the table based on the user selection from the list..
+
+
+5. Add a validate button after the table is displayed on the screen.
+
+6. Display the previous content on the screen as is, do not erase previous contents.
+
+import streamlit as st
+import pandas as pd
+from docx import Document
+import re
+from io import BytesIO
+
+st.set_page_config(page_title="OFS Client On-boarding Tool", page_icon="BRLogo.png")
+
+# Hide deploy button and footer
+hide_streamlit_style = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+</style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
+# Add Page Banner
+st.markdown(
+    """
+    <style>
+    .banner {
+        background-color: #f8f9fa;
+        padding: 10px;
+        text-align: center;
+        border-bottom: 2px solid #ddd;
+    }
+    .banner h1 {
+        color: #333;
+        margin: 0;
+        font-size: 2.5em;
+    }
+    .banner p {
+        color: #666;
+        font-size: 1.2em;
+    }
+    </style>
+    <div class="banner">
+        <h1>OFS Client On-boarding Tool</h1>
+        <p>Gather key client details for seamless OFS setup and activation with Broadridge.</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+def extract_tables_with_highlights_from_docx(docx_file):
+    """Extract tables and append '(Highlight)' to text with background highlight."""
+    doc = Document(docx_file)
+    tables_with_names = []
+    current_table_name = None
+
+    # Define the namespace map
+    namespace = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+
+    for element in doc.element.body:
+        if element.tag.endswith('p'):
+            paragraph_text = ''.join(run.text for run in element.findall(".//w:t", namespaces=namespace))
+            if paragraph_text.strip():
+                current_table_name = paragraph_text.strip()
+        elif element.tag.endswith('tbl'):
+            if current_table_name:
+                table_data = []
+
+                for row in element.findall(".//w:tr", namespaces=namespace):
+                    row_data = []
+
+                    for cell in row.findall(".//w:tc", namespaces=namespace):
+                        cell_text = ''
+                        for run in cell.findall(".//w:r", namespaces=namespace):
+                            text = ''.join(t.text for t in run.findall(".//w:t", namespaces=namespace) if t.text)
+                            
+                            # Check for highlight and append (Highlight)
+                            if run.find(".//w:highlight", namespaces=namespace) is not None:
+                                if "(Highlight)" not in text:
+                                    text += "(Highlight)"
+                            cell_text += text
+
+                        row_data.append(cell_text.strip())
+                    table_data.append(row_data)
+                df = pd.DataFrame(table_data[1:], columns=table_data[0])
+                tables_with_names.append((current_table_name, df))
+                current_table_name = None
+    return tables_with_names
+
+def extract_values_on_button_click(df):
+    """Extract specific values from the dataframe when button is clicked."""
+    connectivity_types = []
+    emails = []
+    column_names = df.columns.tolist()
+
+    # Use pattern matching for flexible description checks
+    connectivity_pattern = re.compile(r'Connectivity Type(s?)', re.IGNORECASE)
+    email_patterns = ["Primary for SFTP", "Primary for MQ", "Primary for NDM"]
+
+    for _, row in df.iterrows():
+        description = row['Description']
+
+        if connectivity_pattern.search(description):
+            for col in column_names:
+                if 'Client Response' in col:
+                    value = row.get(col, '')
+                    # Extract the highlighted part
+                    matches = re.findall(r'\b(\w+?)\b(?=\s*\(Highlight\))', value)
+                    if matches:
+                        connectivity_types.append((description.strip(), col, matches))
+
+        elif description in email_patterns:
+            for col in column_names:
+                if 'Client Response' in col:
+                    value = row.get(col, '')
+                    email_match = re.search(r'Email:\s*([^ ]+?@[^ ]+?\.com)', value)  # Improved regex
+                    if email_match:
+                        emails.append((description.strip(), col, email_match.group(1)))
+
+    return connectivity_types, emails
+
+def main():
+    uploaded_file = st.file_uploader("Choose a file", type=["docx", "doc", "pdf"])
+
+    if uploaded_file is not None:
+        file_size_mb = uploaded_file.size / (1024 * 1024)  # Convert bytes to megabytes
+        file_details = {
+            "filename": uploaded_file.name,
+            "filetype": uploaded_file.type,
+            "filesize": f"{file_size_mb:.2f} MB"  # Format to two decimal places
+        }
+
+        st.info(f"**Filename:** {file_details['filename']}")
+        st.info(f"**Filetype:** {file_details['filetype']}")
+        st.info(f"**Filesize:** {file_details['filesize']}")
+
+        if uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            tables_with_names = extract_tables_with_highlights_from_docx(uploaded_file)
+        # elif uploaded_file.type == "application/msword":
+        #     tables_with_names = extract_tables_with_names_from_doc(uploaded_file)
+        # elif uploaded_file.type == "application/pdf":
+        #     tables_with_names = extract_tables_with_names_from_pdf(uploaded_file)
+        else:
+            st.error("Unsupported file format.")
+            return
+
+        if tables_with_names:
+            st.success(f"Extracted {len(tables_with_names)} tables.")
+
+            table_names = [name for name, _ in tables_with_names]
+            selected_table_name = st.selectbox("Select a table to view:", table_names)
+
+            selected_table_df = next(df for name, df in tables_with_names if name == selected_table_name)
+            st.subheader(f"Selected Table: {selected_table_name}")
+            st.write(selected_table_df)
+
+            if selected_table_name == "General Information":
+                if st.button("Client Required Setups"):
+                    connectivity, emails = extract_values_on_button_click(selected_table_df)
+                    extracted_dict = {}
+
+                    for desc, col, values in connectivity:
+                        if desc not in extracted_dict:
+                            extracted_dict[desc] = {}
+                        extracted_dict[desc][col] = ', '.join(values)
+
+                    for desc, col, value in emails:
+                        if desc not in extracted_dict:
+                            extracted_dict[desc] = {}
+                        extracted_dict[desc][col] = value
+
+                    all_columns = ['Description'] + list(set(col for _, col, values in connectivity + emails))
+                    extracted_df = pd.DataFrame.from_dict(extracted_dict, orient='index').reset_index()
+                    extracted_df.columns = all_columns[:len(extracted_df.columns)]
+                    st.subheader("Extracted Values as DataFrame")
+                    st.write(extracted_df)
+
+        else:
+            st.warning("No tables found in the document.")
+
+if __name__ == "__main__":
+    main()
