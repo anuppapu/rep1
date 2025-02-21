@@ -198,5 +198,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+table_names contains values given below
+['This document includes questionnaires for the following:', 'General Information', 
+'AWS Private Endpoints', 'VPN Setup Questionnaire', 'SFTP Sending Files', 'SFTP Retrieving Files', 'NDM Sending Files', 'MQ Sending Messages', 
+'MQ Retrieving Messages']
 
-['This document includes questionnaires for the following:', 'General Information', 'AWS Private Endpoints', 'VPN Setup Questionnaire', 'SFTP Sending Files', 'SFTP Retrieving Files', 'NDM Sending Files', 'MQ Sending Messages', 'MQ Retrieving Messages']
+
