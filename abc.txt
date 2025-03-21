@@ -1,425 +1,58 @@
-import React, { useState, useEffect } from 'react';
-import {
-  Box,
-  Drawer,
-  List,
-  ListItem,
-  Typography,
-  CircularProgress,
-  Button,
-  IconButton,
-  TextField
-} from '@mui/material';
-import { Menu, Close } from '@mui/icons-material';
-import Home from '@mui/icons-material/Home';  // Import Home icon
-import DocumentUpload from './components/DocumentUpload';
-import TestCaseTable from './components/TestCaseTable';
-import ProductSelectionPopup from './components/ProductSelectionPopup';
-import axios from 'axios';
-import DownloadIcon from '@mui/icons-material/Download';
-import WordIcon from '@mui/icons-material/Description';
-import download from 'js-file-download';
-import { Document, Packer, Paragraph, TextRun } from 'docx';
-import { useNavigate } from 'react-router-dom';  // Import useNavigate
+complete_text = f"{product_description}{sub_product_description}\n\nREQUIREMENTS SPECIFICATION:\n{requirements}"
 
-const LightBlueText = ({ children }) => (
-  <Typography component="span" sx={{ fontWeight: 'bold', color: '#4A90E2' }}>
-    {children}
-  </Typography>
-);
-
-const App = () => {
-  const [businessDoc, setBusinessDoc] = useState(null);
-  const [referenceDoc, setReferenceDoc] = useState(null);
-  const [testCases, setTestCases] = useState([]);
-  const [popupOpen, setPopupOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [selectedProduct, setSelectedProduct] = useState('');
-  const [selectedSubProduct, setSelectedSubProduct] = useState('');
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-
-  const [chatActive, setChatActive] = useState(false);
-  const [chatQuery, setChatQuery] = useState('');
-  const [chatResponse, setChatResponse] = useState('');
-  const [chatLoading, setChatLoading] = useState(false);
-
-  const [startTime, setStartTime] = useState(null);
-  const [endTime, setEndTime] = useState(null);
-
-  const [loadingMessage, setLoadingMessage] = useState('Test Case Generation is in Progress, Please wait...');
-
-  const messages = [
-    'Test Case Generation is in Progress, Please wait...',
-    'Test Case Generation is in Progress, Thanks for your patience...',
-    'Test Case Generation is in Progress, We are almost there...'
-  ];
-
-  const chatMessages = [
-    'Query Processing is in progress, Please wait...',
-    'Compiling your request... We appreciate your patience!',
-    'You will get your response shortly',
-    'We’re organizing your information... Hang tight!'
-  ];
-
-  const navigate = useNavigate();  // Initialize navigate function
-
-  const handleHomeClick = () => {
-    navigate('/');  // Navigate to the landing page
-  };
-
-  const handleEdit = (id, field, value) => {
-    const updatedTestCases = testCases.map((testCase) => {
-      if (testCase.id === id) {
-        return { ...testCase, [field]: value };
-      }
-      return testCase;
-    });
-    setTestCases(updatedTestCases);
-  };
-
-  useEffect(() => {
-    if (chatLoading) {
-      let currentMessageIndex = 0;
-      const messageInterval = setInterval(() => {
-        currentMessageIndex = (currentMessageIndex + 1) % chatMessages.length;
-        setChatLoadingMessage(chatMessages[currentMessageIndex]);
-      }, 4000);
-
-      return () => clearInterval(messageInterval);
-    }
-  }, [chatLoading]);
-
-  const handleGenerate = async () => {
-    if (!businessDoc) {
-      alert('Please upload a business requirements document.');
-      return;
-    }
-    setPopupOpen(true);
-  };
-
-  const handlePopupSubmit = async (product, subProduct) => {
-    setSelectedProduct(product);
-    setSelectedSubProduct(subProduct);
-
-    const formData = new FormData();
-    formData.append('businessDoc', businessDoc);
-    if (referenceDoc) {
-      formData.append('referenceDoc', referenceDoc);
-    }
-    formData.append('product', product);
-    formData.append('subProduct', subProduct);
-
-    setLoading(true);
-    const startTimestamp = new Date();
-    setStartTime(startTimestamp);
-
-    let currentMessageIndex = 0;
-    const messageInterval = setInterval(() => {
-      currentMessageIndex = (currentMessageIndex + 1) % messages.length;
-      setLoadingMessage(messages[currentMessageIndex]);
-    }, 4000);
-
-    try {
-      const response = await axios.post('http://localhost:5000/generate-test-cases', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      });
-
-      const formattedTestCases = response.data.map((testCase, index) => ({
-        ...testCase,
-        id: index,
-        status: 'pending',
-      }));
-      setTestCases(formattedTestCases);
-    } catch (error) {
-      console.error('Error generating test cases:', error);
-    } finally {
-      setLoading(false);
-      clearInterval(messageInterval);
-      const endTimestamp = new Date();
-      setEndTime(endTimestamp);
-    }
-  };
-
-  const formatDuration = (start, end) => {
-    if (!start || !end) return '';
-
-    const duration = new Date(end - start);
-    const hours = String(duration.getUTCHours()).padStart(2, '0');
-    const minutes = String(duration.getUTCMinutes()).padStart(2, '0');
-    const seconds = String(duration.getUTCSeconds()).padStart(2, '0');
-
-    return `${hours}:${minutes}:${seconds}`;
-  };
-
-  const handleChatWithDoc = () => {
-    setChatActive(true);
-  };
-
-  const [chatLoadingMessage, setChatLoadingMessage] = useState(chatMessages[0]);
-
-  const handleSubmitChatQuery = async () => {
-    if (!chatQuery) {
-      alert('Please enter a query');
-      return;
-    }
-
-    if (!businessDoc) {
-      alert('Please upload a business requirements document.');
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append('businessDoc', businessDoc);
-    formData.append('query', chatQuery);
-
-    setChatLoading(true);
-    try {
-      const response = await axios.post('http://localhost:5000/chat-with-document', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      });
-      setChatResponse(response.data.answer);
-    } catch (error) {
-      console.error('Error during chat:', error);
-      alert('An error occurred during the chat process.');
-    } finally {
-      setChatLoading(false);
-    }
-  };
-
-  const downloadCSV = () => {
-    if (!testCases.length) return;
-
-    const headers = Object.keys(testCases[0]).join(',');
-    const rows = testCases.map((testCase) =>
-      Object.values(testCase)
-        .map((value) => `"${typeof value === 'object' ? value.join('; ') : value}"`)
-        .join(',')
-    );
-
-    const csvContent = [headers, ...rows].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', 'test_cases.csv');
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
-  const downloadWord = async () => {
-    if (!testCases.length) return;
-
-    const doc = new Document({
-      sections: [
+        output_format = """
         {
-          children: testCases.map((testCase, index) => {
-            return [
-              new Paragraph({ text: `#${index + 1}` }),
-              new Paragraph({ text: `Test Case Number: ${testCase.testCaseNumber}` }),
-              new Paragraph({ text: `FRD Section: ${testCase.frdSection}` }),
-              new Paragraph({ text: `Detailed Test Description: ${testCase.detailedTestDescription}` }),
-              new Paragraph({ text: `Detailed Expected Result: ${testCase.detailedExpectedResult}` }),
-              new Paragraph({ text: 'Testing Steps:' }),
-              ...testCase.testingSteps.map((step, i) => new Paragraph({ text: `${i + 1}. ${step}`, bullet: { level: 0 } })),
-              new Paragraph({ text: `Priority: ${testCase.priority}` }),
-              new Paragraph({ text: '', spacing: { after: 400 } })
-            ];
-          }).flat()
+        "Test Case Number": "Unique numerical identifier for the test case",
+        "FRD Section": "The section holding the requirements a test case covers",
+        "Detailed Test Description": "A thorough description of the scenario being tested",
+        "Detailed Expected Result": "The expected outcome if the scenario behaves correctly",
+        "Testing Steps": "A clear, step-by-step guide for executing the test case",
+        "Priority": "High/Medium/Low"
         }
-      ]
-    });
+        """
+        
+        prompt = f"""
+        You are a seasoned business analyst specializing in software testing and quality assurance. 
+        Your task is to meticulously design and develop a comprehensive suite of test cases for a recent software enhancement. 
+        The objective is to ensure the software aligns perfectly with the specifications detailed in the provided requirements document, supplemented by insights from any reference documents.
 
-    const buffer = await Packer.toBuffer(doc);
-    download(new Blob([buffer]), 'test_cases.docx');
-  };
+        {complete_text}
 
-  const removeBusinessDoc = () => setBusinessDoc(null);
-  const removeReferenceDoc = () => setReferenceDoc(null);
+        To achieve this, follow these detailed instructions:
 
-  const formatChatResponse = (response) => {
-    const lines = response.split('•');
-    const formattedResponse = lines.map((line, index) => {
-      if (index === 0) {
-        return <Typography key={index} sx={{ marginBottom: '10px' }}>{line.trim()}</Typography>;
-      }
-      return (
-        <li key={index} style={{ marginBottom: '5px', listStyleType: 'disc' }}>
-          {line.trim()}
-        </li>
-      );
-    });
-    return <ul>{formattedResponse.slice(1)}</ul>;
-  };
+        1. **Thorough Requirement Analysis**:
+        - Delve deeply into each functional requirement and associated business logic.
+        - Grasp the overarching objectives and anticipated user behaviors for every feature.
 
-  return (
-    <Box sx={{ display: 'flex', minHeight: '100vh', background: '#ffffff' }}>
-      <Drawer
-        variant="permanent"
-        sx={{
-          width: sidebarOpen ? 300 : 60,
-          transition: 'width 0.3s',
-          '& .MuiDrawer-paper': {
-            width: sidebarOpen ? 300 : 60,
-            transition: 'width 0.3s',
-            boxSizing: 'border-box',
-            borderRight: '1px solid #ccc',
-            backgroundColor: '#f9f9f9',
-          },
-        }}
+        2. **Test Case Development**:
+        - Construct diverse test scenarios, including but not limited to:
+            - **Positive Test Cases**: Scenarios with valid inputs resulting in expected outcomes.
+            - **Negative Test Cases**: Scenarios with invalid or unexpected inputs to validate error handling.
+            - **Boundary Value Analysis**: Tests focusing on the edges of input ranges to uncover any off-by-one errors.
+            - **Edge Case Analysis**: Identify and evaluate scenarios that occur at extreme (maximum/minimum) operating parameters.
 
-      >
-        <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', padding: '10px' }}>
-        <IconButton onClick={() => setSidebarOpen(!sidebarOpen)}>
-            {sidebarOpen ? <Close /> : <Menu />}
-          </IconButton>
-        </Box>
-        {sidebarOpen && (
-          <List sx={{ padding: 2 }}>
-            <ListItem sx={{ flexDirection: 'column', alignItems: 'start' }}>
-              <DocumentUpload label="Upload Business Requirements" onUpload={setBusinessDoc} />
-            </ListItem>
+        3. **Contextual Considerations**:
+        - Factor in various user roles, input variations, and dynamic system states.
+        - Refer to additional context or specifications detailed in the Reference Document when crafting scenarios.
 
-            <ListItem sx={{ flexDirection: 'column', alignItems: 'start', marginTop: '20px' }}>
-              <DocumentUpload label="Upload Supporting Documents (optional)" onUpload={setReferenceDoc} />
-            </ListItem>
+        4. **Output Format**:
+        - Ensure each test case is formatted in a structured JSON format with the specified fields:
+            - **Test Case Number**: A sequential identifier for easy reference.
+            - **FRD Section**: The specific section or identifier of the Functional Requirement Document that the test case addresses.
+            - **Detailed Test Description**: Clearly outline the scenario, including setup conditions and triggers.
+            - **Detailed Expected Result**: Explicitly state the anticipated outcome if the system functions correctly.
+            - **Testing Steps**: A concise, ordered list of procedures to execute the test case.
+            - **Priority**: Assign a priority level (High, Medium, Low) based on the criticality of the test and its impact on essential system functionalities.
 
-            <ListItem sx={{ justifyContent: 'center', marginTop: '20px', width: '100%' }}>
-              <Button variant="contained" color="primary" fullWidth onClick={handleGenerate} disabled={!businessDoc}>
-                Generate Test Cases
-              </Button>
-            </ListItem>
+        5. **Ensure Clarity and Precision**:
+        - Use clear, concise language to draft precise test cases.
+        - Aim for exhaustive coverage, maximizing the breadth of scenarios tested while maintaining depth in logic.
 
-            <ListItem sx={{ justifyContent: 'center', marginTop: '20px', width: '100%' }}>
-              <Button variant="contained" color="secondary" fullWidth onClick={handleChatWithDoc} disabled={!businessDoc}>
-                Chat with Document
-              </Button>
-            </ListItem>
-          </List>
-        )}
-      </Drawer>
+        6. **Collaboration and Review**:
+        - Treat this task as a collaborative effort between documentation insights and your analytical prowess.
+        - Encourage iterative refinement of test cases to improve coverage and accuracy.
 
-      <Box component="main" sx={{ flexGrow: 1, p: 3, textAlign: sidebarOpen ? 'left' : 'center', maxWidth: '700px', margin: '0 auto' }}>
-        <Typography variant="h4" gutterBottom sx={{ color: '#1565C0', textAlign: 'center', marginBottom: '20px' }}>
-          AI-Driven Test Case Generation
-        </Typography>
-        <Typography variant="body1" sx={{ color: '#333', marginBottom: '20px', textAlign: 'center', whiteSpace: 'pre-line', lineHeight: 1.6 }}>
-          Transform your testing approach with the power of AI.</Typography>
-          
-          {/* <br /><br />
-          <LightBlueText>Key Features:</LightBlueText>
-          <br/>
-          1. <LightBlueText>Automated Test Case Creation:</LightBlueText> Instantly generate functional test cases tailored to your uploaded documentation, saving you valuable time and effort.
-          <br/>
-          2. <LightBlueText>Flexible Document Analysis:</LightBlueText> Our AI supports a wide range of document types for seamless integration into your workflow.
-          <br/>
-          3. <LightBlueText>Efficient Validation & Export:</LightBlueText> Quickly validate the generated test cases and export the approved ones in your preferred format.
-          <br/>
-          4. <LightBlueText>Interactive Document Insights:</LightBlueText> Seamlessly engage with your business requirement document to uncover valuable insights using the chat option.
-          <br/><br/> */}
-          <br/>
-          <LightBlueText>Instructions:</LightBlueText>
-          <br/>
-          <strong>Step 1:</strong> <LightBlueText>Upload Business Requirements</LightBlueText>
-          <br />
-          Begin by clicking the "Upload Business Requirements" button. Choose the relevant business requirements document from your device and proceed to upload it.
-          <br/><br/>
-          <strong>Step 2:</strong> <LightBlueText>Upload Supporting Documents (Optional)</LightBlueText>
-          <br />
-          Next, click on the "Upload Supporting Documents" button. Select any additional documents from your device to provide further context to the LLM.
-          <br/><br/>
-          <strong>Step 3:</strong> <LightBlueText>Generate Test Cases</LightBlueText>
-          <br/>
-          Once the previous steps are complete, click the "Generate Test Cases" button to create test scenarios based on the uploaded business requirements.
-          <br/><br/>
-          <strong>Step 4:</strong> <LightBlueText>Chat with Document</LightBlueText>
-          <br/>
-          Click the "Chat with Document" button to discover valuable insights from the business requirements document.
-          <br/>
-
-          {/* <LightBlueText>Experience a smarter, faster way to handle test case development.</LightBlueText> */}
-        {/* </Typography> */}
-        {loading ? (
-          <Box sx={{ mt: 3, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-            <CircularProgress />
-            <Typography variant="body1" sx={{ mt: 2, color: '#1565C0', fontWeight: 'bold' }}>
-              {loadingMessage}
-            </Typography>
-          </Box>
-        ) : (
-          <>
-            {testCases.length > 0 && (
-              <>
-                <Typography variant="h5" sx={{ color: '#1565C0', fontWeight: 'bold', marginBottom: '20px' }}>
-                  AI Generated Test Cases
-                </Typography>
-                <Box sx={{ position: 'relative', width: '100%' }}>
-                  <IconButton sx={{ position: 'absolute', right: 0, top: -40 }} onClick={downloadCSV}>
-                    <DownloadIcon />
-                  </IconButton>
-                  <TestCaseTable testCases={testCases} onEdit={handleEdit} />
-                  <Box sx={{ marginTop: 3 }}>
-                    <Typography variant="body1" sx={{ color: '#333' }}>
-                      <strong>Start Time:</strong> {startTime && startTime.toLocaleTimeString()}
-                    </Typography>
-                    <Typography variant="body1" sx={{ color: '#333' }}>
-                      <strong>End Time:</strong> {endTime && endTime.toLocaleTimeString()}
-                    </Typography>
-                    <Typography variant="body1" sx={{ color: '#333' }}>
-                      <strong>Total Time Taken:</strong> {formatDuration(startTime, endTime)}
-                    </Typography>
-                  </Box>
-                </Box>
-              </>
-            )}
-            {chatActive && (
-              <Box sx={{ marginTop: '20px' }}>
-                <Typography variant="h6" sx={{ color: '#1565C0', marginBottom: '10px' }}>
-                  Chat with Document
-                </Typography>
-                <TextField
-                  label="Enter your query"
-                  fullWidth
-                  variant="outlined"
-                  value={chatQuery}
-                  onChange={(e) => setChatQuery(e.target.value)}
-                  sx={{ marginBottom: '10px' }}
-                />
-                <Button variant="contained" color="primary" fullWidth onClick={handleSubmitChatQuery} disabled={chatLoading}>
-                  Send Query
-                </Button>
-                {chatLoading ? (
-                  <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', mt: 2 }}>
-                    <CircularProgress />
-                    <Typography variant="body1" sx={{ ml: 2, color: '#1565C0', fontWeight: 'bold' }}>
-                      {chatLoadingMessage}
-                    </Typography>
-                  </Box>
-                ) : chatResponse && (
-                  <Box>
-                    <Typography variant="body1" sx={{ marginTop: '10px', color: '#333' }}>
-                      <strong>Bot Answer:</strong>
-                    </Typography>
-                    {formatChatResponse(chatResponse)}
-                  </Box>
-                )}
-              </Box>
-            )}
-          </>
-        )}
-        <ProductSelectionPopup
-          open={popupOpen}
-          onClose={() => setPopupOpen(false)}
-          onSubmit={handlePopupSubmit}
-        />
-      </Box>
-    </Box>
-  );
-};
-
-export default App;
+        The ultimate goal is to generate a highly detailed set of test cases that leave no stone unturned in verifying the software's adherence to specified requirements. Your output must be a JSON array encapsulating all test cases, ensuring clarity and completeness while utilizing the insights from both requirement and reference documents. There is no limit on document length, allowing comprehensive analysis. Always present the output in JSON {output_format} format enclosed in square brackets.
+        """
+        
+        return prompt
