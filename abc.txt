@@ -56,3 +56,21 @@ complete_text = f"{product_description}{sub_product_description}\n\nREQUIREMENTS
         """
         
         return prompt
+in the above prompt add below instrcutions and provide the consolidated prompt.
+Generate test cases with the following instructions:
+
+1. **Primary Focus: Unit Test Cases**
+   - Start by generating unit test cases for the individual component(s) involved in the requirement (e.g., a specific function or module).
+   - Stop generating unit test cases once the component's behavior is fully covered, meaning all logical paths and conditions are tested.
+   - Label each test case as "Unit Test Case [Number]".
+ 
+2. **Secondary Focus: Regression Test Cases**
+   - After unit behavior is fully covered, generate regression test cases to ensure system stability.
+   - Focus on:
+     - Interactions between the component and other system parts (e.g., UI, database, existing features).
+     - Validation that existing functionality remains unchanged.
+     - Scenarios impacted by the requirement (e.g., end-to-end workflows).
+   - Continue until system stability is assured, meaning critical integrations and dependencies are validated.
+   - Label each test case as "Regression Test Case [Number]".
+3. **Output Format**:
+            - **Test Case Number**: A sequential identifier for easy reference. for an example for "Unit Test Cases" - Unit TC [Number] and for "Regression Test Cases"- Regression TC [Number]
