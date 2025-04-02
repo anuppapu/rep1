@@ -1,76 +1,301 @@
-complete_text = f"{product_description}{sub_product_description}\n\nREQUIREMENTS SPECIFICATION:\n{requirements}"
+take below 2 app.py code for test case generation and jira ticket fetcher. make it 2 independent module so that each one will not impact the performance of other.
+make both 2 different scripts and call them from another App.py script. make sure it should not impact the performance of each other.
+provide the entire updated code.
 
-        output_format = """
-        {
-        "Test Case Number": "Unique numerical identifier for the test case",
-        "FRD Section": "The section holding the requirements a test case covers",
-        "Detailed Test Description": "A thorough description of the scenario being tested",
-        "Detailed Expected Result": "The expected outcome if the scenario behaves correctly",
-        "Testing Steps": "A clear, step-by-step guide for executing the test case",
-        "Priority": "High/Medium/Low"
+App.py for test case generation 
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import os
+import tempfile
+from document_extractor import DocumentExtractor
+from chat_with_doc import generate_answer
+from concurrent.futures import ThreadPoolExecutor
+import functools
+import time
+
+app = Flask(__name__)
+CORS(app)
+
+UPLOAD_FOLDER = tempfile.mkdtemp()
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+MAX_WORKERS = os.cpu_count() or 4  # Set a reasonable default based on CPU cores
+
+extractor = DocumentExtractor()
+
+# Cache for storing document content
+cleaned_text_cache = {}  # For raw document text extraction
+cleaned_business_text_cache = {}  # For storing cleaned business text by session
+cache_ttl = 3600  # Cache time-to-live in seconds (1 hour)
+
+def extract_content(extension, path):
+    """Extract content from a document with caching"""
+    if path in cleaned_text_cache:
+        return cleaned_text_cache[path]
+    cleaned_text = extractor.exract_content_from_doc(extension, path)
+    cleaned_text_cache[path] = cleaned_text
+    return cleaned_text
+
+def get_combined_text(file_content, text_content):
+    """Combine file and text content for processing"""
+    parts = []
+    if file_content:
+        parts.append("Business Requirement Content:")
+        parts.append(file_content)
+    if text_content:
+        parts.append("Reference Content:")
+        parts.append(text_content)
+    return "\n\n".join(parts)
+
+@functools.lru_cache(maxsize=128)
+def get_file_extension(file_path):
+    """Get file extension with caching"""
+    return os.path.splitext(file_path)[1][1:]
+
+def is_cache_valid(session_id):
+    """Check if the cached data for the session is still valid"""
+    if session_id not in cleaned_business_text_cache:
+        return False
+    
+    cached_data = cleaned_business_text_cache[session_id]
+    current_time = time.time()
+    
+    # Check if the cached data has expired
+    if current_time - cached_data.get('timestamp', 0) > cache_ttl:
+        return False
+    
+    return True
+
+@app.route('/generate-test-cases', methods=['POST'])
+def generate_test_cases():
+    # Ensure upload folder exists
+    if not os.path.exists(app.config['UPLOAD_FOLDER']):
+        os.makedirs(app.config['UPLOAD_FOLDER'])
+    
+    # Get form data
+    business_doc = request.files.get('businessDoc')
+    reference_docs = request.files.getlist('referenceDoc[]')
+    business_text = request.form.get('businessText', '')
+    reference_text = request.form.get('referenceText', '')
+    product = request.form.get('product')
+    sub_products = request.form.getlist('subProduct[]')
+    session_id = request.form.get('sessionId', 'default')  # Add session ID for tracking
+    
+    # Log received files
+    print(f"Received reference_docs: {[doc.filename for doc in reference_docs]}")
+    print(f"Received reference_text: {reference_text}")
+    
+    # Validation
+    if not business_doc and not business_text:
+        return jsonify({'error': 'No business document or text provided'}), 400
+
+    # File paths to track for cleanup
+    business_doc_path = None
+    reference_doc_paths = []
+
+    try:
+        # Save the business document if present
+        if business_doc:
+            business_doc_path = os.path.join(app.config['UPLOAD_FOLDER'], business_doc.filename)
+            business_doc.save(business_doc_path)
+        
+        # Save all reference documents
+        for ref_doc in reference_docs:
+            ref_doc_path = os.path.join(app.config['UPLOAD_FOLDER'], ref_doc.filename)
+            ref_doc.save(ref_doc_path)
+            reference_doc_paths.append(ref_doc_path)
+
+        # Set up parallel text extraction
+        tasks = []
+        
+        # Determine optimal number of workers
+        num_docs = len(reference_docs) + (1 if business_doc else 0)
+        workers = min(MAX_WORKERS, max(1, num_docs))
+        
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # Submit business document task if present
+            if business_doc_path:
+                business_extension = get_file_extension(business_doc_path)
+                tasks.append(('business', executor.submit(extract_content, business_extension, business_doc_path)))
+            
+            # Submit all reference document tasks
+            for i, ref_doc_path in enumerate(reference_doc_paths):
+                reference_extension = get_file_extension(ref_doc_path)
+                tasks.append((f'ref_{i}', executor.submit(extract_content, reference_extension, ref_doc_path)))
+            
+            # Process results
+            cleaned_business_text = business_text if not business_doc_path else None
+            cleaned_reference_texts = [reference_text] if reference_text else []
+            
+            # Collect results as they complete
+            for name, future in tasks:
+                try:
+                    result = future.result()
+                    if name == 'business':
+                        cleaned_business_text = result
+                    else:
+                        cleaned_reference_texts.append(result)
+                except Exception as e:
+                    print(f"Error processing {name}: {str(e)}")
+        
+        # Cache the cleaned business text for this session
+        if cleaned_business_text:
+            cleaned_business_text_cache[session_id] = {
+                'text': cleaned_business_text,
+                'timestamp': time.time()
+            }
+        
+        # Filter out None or empty strings and join the reference texts
+        combined_reference_text = '\n'.join(filter(None, cleaned_reference_texts))
+        
+        # Create the combined text
+        combined_text = get_combined_text(cleaned_business_text, combined_reference_text)
+        print(f"Combined Text length: {len(combined_text)}")
+        print(f"Combined Text: {combined_text}")
+        
+        # Generate test cases
+        test_case_prompt = extractor.generate_test_case_prompt(combined_text, product, sub_products)
+        test_cases_df = extractor.generate_testcases(test_case_prompt)
+        
+        # Return results as JSON
+        return test_cases_df.to_json(orient='records')
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        # Clean up temporary files
+        if business_doc_path and os.path.exists(business_doc_path):
+            os.remove(business_doc_path)
+        for ref_doc_path in reference_doc_paths:
+            if os.path.exists(ref_doc_path):
+                os.remove(ref_doc_path)
+
+@app.route('/chat-with-document', methods=['POST'])
+def chat_with_document():
+    # Get form data
+    business_doc = request.files.get('businessDoc')
+    business_text = request.form.get('businessText', '')
+    query = request.form.get('query')
+    session_id = request.form.get('sessionId', 'default')
+    
+    # Validation
+    if not query:
+        return jsonify({'error': 'Query is required'}), 400
+    
+    # Check if we don't have cached data and no input is provided
+    if not is_cache_valid(session_id) and not business_doc and not business_text:
+        return jsonify({'error': 'No document content available'}), 400
+
+    business_doc_path = None
+
+    try:
+        # Check if we already have cleaned business text for this session
+        cleaned_business_text = None
+        
+        if is_cache_valid(session_id):
+            print(f"Using cached cleaned business text for session {session_id}")
+            cleaned_business_text = cleaned_business_text_cache[session_id]['text']
+        else:
+            # We need to process the document since no cached text is available
+            if not os.path.exists(app.config['UPLOAD_FOLDER']):
+                os.makedirs(app.config['UPLOAD_FOLDER'])
+                
+            # Process the business document if present
+            cleaned_business_text = business_text
+            if business_doc:
+                business_doc_path = os.path.join(app.config['UPLOAD_FOLDER'], business_doc.filename)
+                business_doc.save(business_doc_path)
+                business_extension = get_file_extension(business_doc_path)
+                cleaned_business_text = extract_content(business_extension, business_doc_path)
+            
+            # Cache the cleaned business text
+            if cleaned_business_text:
+                cleaned_business_text_cache[session_id] = {
+                    'text': cleaned_business_text,
+                    'timestamp': time.time()
+                }
+                print(f"Generated and cached new cleaned business text for session {session_id}")
+        
+        # Generate answer using the cleaned business text
+        answer = generate_answer(cleaned_business_text, query)
+        return jsonify({'answer': answer})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        # Clean up temporary files
+        if business_doc_path and os.path.exists(business_doc_path):
+            os.remove(business_doc_path)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+-----------------------------------------
+App.py for JIRA Ticket fetch
+from flask import Flask, request, jsonify, session
+from flask_cors import CORS
+from jira import JIRA
+import os
+
+app = Flask(__name__)
+CORS(app, supports_credentials=True)
+app.secret_key = os.urandom(24)
+
+@app.route('/jira/connect', methods=['POST'])
+def connect_to_jira():
+    data = request.get_json()
+    server_url = data.get('serverUrl')
+    username = data.get('username')
+    password = data.get('password')
+
+    try:
+        jira = JIRA(
+            server=server_url,
+            basic_auth=(username, password)
+        )
+        session['jira_auth'] = {'server_url': server_url, 'username': username, 'password': password}
+        return jsonify({"message": "Successfully connected to Jira"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route('/api/ticket', methods=['POST'])
+def fetch_ticket_details():
+    data = request.get_json()
+    ticket_id = data.get('ticketId')
+
+    server_url = data.get('serverUrl')
+    username = data.get('username')
+    password = data.get('password')
+
+    if not all([server_url, username, password]):
+        if 'jira_auth' not in session:
+            return jsonify({"error": "Not authenticated"}), 403
+        auth = session['jira_auth']
+        server_url = auth['server_url']
+        username = auth['username']
+        password = auth['password']
+
+    try:
+        jira = JIRA(
+            server=server_url,
+            basic_auth=(username, password)
+        )
+        issue = jira.issue(ticket_id)
+
+        ticket_details = {
+            'Key': issue.key,
+            'Summary': issue.fields.summary,
+            'Status': issue.fields.status.name,
+            'Assignee': issue.fields.assignee.displayName if issue.fields.assignee else 'Unassigned',
+            'Reporter': issue.fields.reporter.displayName if issue.fields.reporter else 'Unknown',
+            'Priority': issue.fields.priority.name if issue.fields.priority else 'None',
+            'Created': issue.fields.created.split('T')[0],
+            'Description': issue.fields.description or 'No description provided'
         }
-        """
-        
-        prompt = f"""
-        You are a seasoned business analyst specializing in software testing and quality assurance. 
-        Your task is to meticulously design and develop a comprehensive suite of test cases for a recent software enhancement. 
-        The objective is to ensure the software aligns perfectly with the specifications detailed in the provided requirements document, supplemented by insights from any reference documents.
 
-        {complete_text}
+        return jsonify(ticket_details), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
-        To achieve this, follow these detailed instructions:
-
-        1. **Thorough Requirement Analysis**:
-        - Delve deeply into each functional requirement and associated business logic.
-        - Grasp the overarching objectives and anticipated user behaviors for every feature.
-
-        2. **Test Case Development**:
-        - Construct diverse test scenarios, including but not limited to:
-            - **Positive Test Cases**: Scenarios with valid inputs resulting in expected outcomes.
-            - **Negative Test Cases**: Scenarios with invalid or unexpected inputs to validate error handling.
-            - **Boundary Value Analysis**: Tests focusing on the edges of input ranges to uncover any off-by-one errors.
-            - **Edge Case Analysis**: Identify and evaluate scenarios that occur at extreme (maximum/minimum) operating parameters.
-
-        3. **Contextual Considerations**:
-        - Factor in various user roles, input variations, and dynamic system states.
-        - Refer to additional context or specifications detailed in the Reference Document when crafting scenarios.
-
-        4. **Output Format**:
-        - Ensure each test case is formatted in a structured JSON format with the specified fields:
-            - **Test Case Number**: A sequential identifier for easy reference.
-            - **FRD Section**: The specific section or identifier of the Functional Requirement Document that the test case addresses.
-            - **Detailed Test Description**: Clearly outline the scenario, including setup conditions and triggers.
-            - **Detailed Expected Result**: Explicitly state the anticipated outcome if the system functions correctly.
-            - **Testing Steps**: A concise, ordered list of procedures to execute the test case.
-            - **Priority**: Assign a priority level (High, Medium, Low) based on the criticality of the test and its impact on essential system functionalities.
-
-        5. **Ensure Clarity and Precision**:
-        - Use clear, concise language to draft precise test cases.
-        - Aim for exhaustive coverage, maximizing the breadth of scenarios tested while maintaining depth in logic.
-
-        6. **Collaboration and Review**:
-        - Treat this task as a collaborative effort between documentation insights and your analytical prowess.
-        - Encourage iterative refinement of test cases to improve coverage and accuracy.
-
-        The ultimate goal is to generate a highly detailed set of test cases that leave no stone unturned in verifying the software's adherence to specified requirements. Your output must be a JSON array encapsulating all test cases, ensuring clarity and completeness while utilizing the insights from both requirement and reference documents. There is no limit on document length, allowing comprehensive analysis. Always present the output in JSON {output_format} format enclosed in square brackets.
-        """
-        
-        return prompt
-in the above prompt add below instrcutions and provide the consolidated prompt.
-Generate test cases with the following instructions:
-
-1. **Primary Focus: Unit Test Cases**
-   - Start by generating unit test cases for the individual component(s) involved in the requirement (e.g., a specific function or module).
-   - Stop generating unit test cases once the component's behavior is fully covered, meaning all logical paths and conditions are tested.
-   - Label each test case as "Unit Test Case [Number]".
- 
-2. **Secondary Focus: Regression Test Cases**
-   - After unit behavior is fully covered, generate regression test cases to ensure system stability.
-   - Focus on:
-     - Interactions between the component and other system parts (e.g., UI, database, existing features).
-     - Validation that existing functionality remains unchanged.
-     - Scenarios impacted by the requirement (e.g., end-to-end workflows).
-   - Continue until system stability is assured, meaning critical integrations and dependencies are validated.
-   - Label each test case as "Regression Test Case [Number]".
-3. **Output Format**:
-            - **Test Case Number**: A sequential identifier for easy reference. for an example for "Unit Test Cases" - Unit TC [Number] and for "Regression Test Cases"- Regression TC [Number]
+if __name__ == '__main__':
+    app.run(debug=True)
