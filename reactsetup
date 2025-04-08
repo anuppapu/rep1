@@ -1,0 +1,75 @@
+REACT FRONT-END SETUP GUIDE
+
+1)	Prerequisites to Download:
+•	Node.js and npm (Node Package Manager) has to be downloaded.
+•	Raise Ticket to download Node.js.
+•	Ensure that you have latest version of Node.js installed. This will include npm, which is used to manage packages.
+
+2)	Setting Up React Project:
+•	Use the command below in vs code terminal, to create a new React application:
+npx create-react-app my-react-app
+•	Replace my-react-app with your desired project name.
+
+3)	Proxy and Network Settings:
+•	Use the npm config command vs code terminal, to set up proxy:
+npm config set https-proxy http://Windows Username@Windows Password@10.98.21.23:8080
+npm config set proxy http:// Windows Username@Windows Password @10.98.21.23:8080
+
+npm config set https-proxy http://dasan:W@lcom@18@10.98.21.23:8080
+npm config set proxy http://dasan:W@lcom@18@10.98.21.23:8080
+
+•	Replace Windows Username & Password with your Windows Username & Password.
+•	Contact Naveen for more information.
+
+4)	Common Dependencies to consider:
+•	React Router for client-side navigation(in vs code terminal):
+npm install react-router-dom
+•	Axios for HTTP requests(in vs code terminal):
+npm install axios
+Verify the Installation
+  npm list react
+  npm list react-dom
+
+Once above steps are done, perform below steps manually.
+
+>mkdir src\\components
+src\components\VoiceAgent.jsx
+src\components\RecordButton.jsx
+src\components\RecordButton.jsx
+
+voice-project-status/
+├── src/
+│   ├── components/
+│   │   ├── VoiceAgent.jsx
+│   │   ├── MessageList.jsx
+│   │   └── RecordButton.jsx
+│   ├── App.js
+│   ├── index.js
+│   └── index.css
+├── public/
+│   └── index.html
+└── package.json
+ 
+5)	AG Grid and Licensing:
+•	AG Grid : This library is used for advanced data tables and grid functionality.
+•	License Key is needed.
+•	Contact Naveen for AG Grid and License Key.
+
+6)	CORS (Cross-Origin Resource Sharing):
+•	What is CORS : It is a security feature implemented by browsers to prevent unauthorized access to resources on a different domain.
+•	Why is it Important : If your React app is running on http://localhost:3000 and your API server is on http://localhost:5000 , CORS needs to be configured on the server to allow the frontend to make API requests.
+•	Install the CORS package(in vs code terminal):
+npm install cors
+•	Add it to server code:
+app = Flask(__name__)
+cors(app)
+
+7)	Useful Commands:
+•	Installing Dependencies(in vs code terminal):
+npm install [package-name]
+•	Running Tests (in vs code terminal):
+npm test
+•	Running Development Server in vs code terminal(To Start React application):
+npm start
+•	Building for Production(in vs code terminal):
+npm run build 
