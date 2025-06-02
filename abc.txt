@@ -1,301 +1,40 @@
-take below 2 app.py code for test case generation and jira ticket fetcher. make it 2 independent module so that each one will not impact the performance of other.
-make both 2 different scripts and call them from another App.py script. make sure it should not impact the performance of each other.
-provide the entire updated code.
+Project 1 - Project Insight
+Overview : The AI-based virtual assistant leverages NLP to interact with data repositories, process data, and deliver insights on projects, work requests, and resources. It enhances efficiency by offering self-service options, providing a unified user experience, delivering instant guidance, and employing predictive analytics to maintain project alignment. This approach improves productivity by generating high-quality outputs swiftly and reduces the risk of human errors.
 
-App.py for test case generation 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import os
-import tempfile
-from document_extractor import DocumentExtractor
-from chat_with_doc import generate_answer
-from concurrent.futures import ThreadPoolExecutor
-import functools
-import time
+Tech Stack:
+RASA(Rasa Core + Rasa NLU)
+Data Base - SQL DB
+Gen AI(OpenAI-GPT-o1) 
+User Interface(HTML + CSS) 
 
-app = Flask(__name__)
-CORS(app)
+Project 2 - Test Gen AI 
+Overview : The AI BOT is designed to automatically generate UAT test case scenarios for clients based on past experiences and specific project requirements. Its initial focus would be on products like Impact, BPS, and Shadow Suite, catering to new client onboarding and enhancement requests. This tool aims to significantly reduce time to market by providing clients with a comprehensive UAT test list derived from contracts, pricing proposals, and early engagement documents. By ensuring early agreement on success criteria, the average UAT period for relevant projects is expected to decrease by 25–50%.
 
-UPLOAD_FOLDER = tempfile.mkdtemp()
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-MAX_WORKERS = os.cpu_count() or 4  # Set a reasonable default based on CPU cores
+Tech Stack:
+Text2SQL(OpenAI-GPT-o1) 
+Data Base - SQL DB
+Flask API
+User Interface (React)
 
-extractor = DocumentExtractor()
+Project 3 - Onboard Assist
+Overview : The smart platform leverages Gen AI to accelerate and standardize the Environment Setup for new client onboarding, significantly reducing overall timelines and enhancing quality and client experience. By automating processes and standardizing practices, it allows for uniform information management independent of SMEs. This approach also cuts down research time for environment setup by 20-25%, enabling quicker revenue realization.
 
-# Cache for storing document content
-cleaned_text_cache = {}  # For raw document text extraction
-cleaned_business_text_cache = {}  # For storing cleaned business text by session
-cache_ttl = 3600  # Cache time-to-live in seconds (1 hour)
+Tech Stack:
+Text2SQL(OpenAI-GPT-o1) 
+Data Base - SQL DB
+Flask API
+User Interface (React)
 
-def extract_content(extension, path):
-    """Extract content from a document with caching"""
-    if path in cleaned_text_cache:
-        return cleaned_text_cache[path]
-    cleaned_text = extractor.exract_content_from_doc(extension, path)
-    cleaned_text_cache[path] = cleaned_text
-    return cleaned_text
+Project 4 - Fix Message Parser
+Overview : This tool has been developed to automatically parse FIX messages into downloadable CSV format, enhancing the analysis and processing of financial data. This solution improves efficiency and accuracy, minimizes error risks, and reduces costs. It also offers better audit trails, faster decision-making, improved interoperability, and scalability for high-volume trading environments.
 
-def get_combined_text(file_content, text_content):
-    """Combine file and text content for processing"""
-    parts = []
-    if file_content:
-        parts.append("Business Requirement Content:")
-        parts.append(file_content)
-    if text_content:
-        parts.append("Reference Content:")
-        parts.append(text_content)
-    return "\n\n".join(parts)
+Tech Stack:
+OpenAI(OpenAI-GPT-4.1)
+User Interface (React)
 
-@functools.lru_cache(maxsize=128)
-def get_file_extension(file_path):
-    """Get file extension with caching"""
-    return os.path.splitext(file_path)[1][1:]
+Project 5 - Sentry AI model
+Overview : The proposed AI tool automates the comparison of existing bookmarked PDF indentures with new ones to identify the closest deal for cloning and auto-bookmarking. This tool offers significant time and cost savings, projecting a reduction of 360 hours per year with 120 models. It enhances accuracy by minimizing human errors and is scalable to handle large document volumes. Additionally, the tool continuously learns and improves, becoming more adept at recognizing patterns and nuances over time.
 
-def is_cache_valid(session_id):
-    """Check if the cached data for the session is still valid"""
-    if session_id not in cleaned_business_text_cache:
-        return False
-    
-    cached_data = cleaned_business_text_cache[session_id]
-    current_time = time.time()
-    
-    # Check if the cached data has expired
-    if current_time - cached_data.get('timestamp', 0) > cache_ttl:
-        return False
-    
-    return True
-
-@app.route('/generate-test-cases', methods=['POST'])
-def generate_test_cases():
-    # Ensure upload folder exists
-    if not os.path.exists(app.config['UPLOAD_FOLDER']):
-        os.makedirs(app.config['UPLOAD_FOLDER'])
-    
-    # Get form data
-    business_doc = request.files.get('businessDoc')
-    reference_docs = request.files.getlist('referenceDoc[]')
-    business_text = request.form.get('businessText', '')
-    reference_text = request.form.get('referenceText', '')
-    product = request.form.get('product')
-    sub_products = request.form.getlist('subProduct[]')
-    session_id = request.form.get('sessionId', 'default')  # Add session ID for tracking
-    
-    # Log received files
-    print(f"Received reference_docs: {[doc.filename for doc in reference_docs]}")
-    print(f"Received reference_text: {reference_text}")
-    
-    # Validation
-    if not business_doc and not business_text:
-        return jsonify({'error': 'No business document or text provided'}), 400
-
-    # File paths to track for cleanup
-    business_doc_path = None
-    reference_doc_paths = []
-
-    try:
-        # Save the business document if present
-        if business_doc:
-            business_doc_path = os.path.join(app.config['UPLOAD_FOLDER'], business_doc.filename)
-            business_doc.save(business_doc_path)
-        
-        # Save all reference documents
-        for ref_doc in reference_docs:
-            ref_doc_path = os.path.join(app.config['UPLOAD_FOLDER'], ref_doc.filename)
-            ref_doc.save(ref_doc_path)
-            reference_doc_paths.append(ref_doc_path)
-
-        # Set up parallel text extraction
-        tasks = []
-        
-        # Determine optimal number of workers
-        num_docs = len(reference_docs) + (1 if business_doc else 0)
-        workers = min(MAX_WORKERS, max(1, num_docs))
-        
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            # Submit business document task if present
-            if business_doc_path:
-                business_extension = get_file_extension(business_doc_path)
-                tasks.append(('business', executor.submit(extract_content, business_extension, business_doc_path)))
-            
-            # Submit all reference document tasks
-            for i, ref_doc_path in enumerate(reference_doc_paths):
-                reference_extension = get_file_extension(ref_doc_path)
-                tasks.append((f'ref_{i}', executor.submit(extract_content, reference_extension, ref_doc_path)))
-            
-            # Process results
-            cleaned_business_text = business_text if not business_doc_path else None
-            cleaned_reference_texts = [reference_text] if reference_text else []
-            
-            # Collect results as they complete
-            for name, future in tasks:
-                try:
-                    result = future.result()
-                    if name == 'business':
-                        cleaned_business_text = result
-                    else:
-                        cleaned_reference_texts.append(result)
-                except Exception as e:
-                    print(f"Error processing {name}: {str(e)}")
-        
-        # Cache the cleaned business text for this session
-        if cleaned_business_text:
-            cleaned_business_text_cache[session_id] = {
-                'text': cleaned_business_text,
-                'timestamp': time.time()
-            }
-        
-        # Filter out None or empty strings and join the reference texts
-        combined_reference_text = '\n'.join(filter(None, cleaned_reference_texts))
-        
-        # Create the combined text
-        combined_text = get_combined_text(cleaned_business_text, combined_reference_text)
-        print(f"Combined Text length: {len(combined_text)}")
-        print(f"Combined Text: {combined_text}")
-        
-        # Generate test cases
-        test_case_prompt = extractor.generate_test_case_prompt(combined_text, product, sub_products)
-        test_cases_df = extractor.generate_testcases(test_case_prompt)
-        
-        # Return results as JSON
-        return test_cases_df.to_json(orient='records')
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-    finally:
-        # Clean up temporary files
-        if business_doc_path and os.path.exists(business_doc_path):
-            os.remove(business_doc_path)
-        for ref_doc_path in reference_doc_paths:
-            if os.path.exists(ref_doc_path):
-                os.remove(ref_doc_path)
-
-@app.route('/chat-with-document', methods=['POST'])
-def chat_with_document():
-    # Get form data
-    business_doc = request.files.get('businessDoc')
-    business_text = request.form.get('businessText', '')
-    query = request.form.get('query')
-    session_id = request.form.get('sessionId', 'default')
-    
-    # Validation
-    if not query:
-        return jsonify({'error': 'Query is required'}), 400
-    
-    # Check if we don't have cached data and no input is provided
-    if not is_cache_valid(session_id) and not business_doc and not business_text:
-        return jsonify({'error': 'No document content available'}), 400
-
-    business_doc_path = None
-
-    try:
-        # Check if we already have cleaned business text for this session
-        cleaned_business_text = None
-        
-        if is_cache_valid(session_id):
-            print(f"Using cached cleaned business text for session {session_id}")
-            cleaned_business_text = cleaned_business_text_cache[session_id]['text']
-        else:
-            # We need to process the document since no cached text is available
-            if not os.path.exists(app.config['UPLOAD_FOLDER']):
-                os.makedirs(app.config['UPLOAD_FOLDER'])
-                
-            # Process the business document if present
-            cleaned_business_text = business_text
-            if business_doc:
-                business_doc_path = os.path.join(app.config['UPLOAD_FOLDER'], business_doc.filename)
-                business_doc.save(business_doc_path)
-                business_extension = get_file_extension(business_doc_path)
-                cleaned_business_text = extract_content(business_extension, business_doc_path)
-            
-            # Cache the cleaned business text
-            if cleaned_business_text:
-                cleaned_business_text_cache[session_id] = {
-                    'text': cleaned_business_text,
-                    'timestamp': time.time()
-                }
-                print(f"Generated and cached new cleaned business text for session {session_id}")
-        
-        # Generate answer using the cleaned business text
-        answer = generate_answer(cleaned_business_text, query)
-        return jsonify({'answer': answer})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-    finally:
-        # Clean up temporary files
-        if business_doc_path and os.path.exists(business_doc_path):
-            os.remove(business_doc_path)
-
-if __name__ == '__main__':
-    app.run(debug=True)
------------------------------------------
-App.py for JIRA Ticket fetch
-from flask import Flask, request, jsonify, session
-from flask_cors import CORS
-from jira import JIRA
-import os
-
-app = Flask(__name__)
-CORS(app, supports_credentials=True)
-app.secret_key = os.urandom(24)
-
-@app.route('/jira/connect', methods=['POST'])
-def connect_to_jira():
-    data = request.get_json()
-    server_url = data.get('serverUrl')
-    username = data.get('username')
-    password = data.get('password')
-
-    try:
-        jira = JIRA(
-            server=server_url,
-            basic_auth=(username, password)
-        )
-        session['jira_auth'] = {'server_url': server_url, 'username': username, 'password': password}
-        return jsonify({"message": "Successfully connected to Jira"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route('/api/ticket', methods=['POST'])
-def fetch_ticket_details():
-    data = request.get_json()
-    ticket_id = data.get('ticketId')
-
-    server_url = data.get('serverUrl')
-    username = data.get('username')
-    password = data.get('password')
-
-    if not all([server_url, username, password]):
-        if 'jira_auth' not in session:
-            return jsonify({"error": "Not authenticated"}), 403
-        auth = session['jira_auth']
-        server_url = auth['server_url']
-        username = auth['username']
-        password = auth['password']
-
-    try:
-        jira = JIRA(
-            server=server_url,
-            basic_auth=(username, password)
-        )
-        issue = jira.issue(ticket_id)
-
-        ticket_details = {
-            'Key': issue.key,
-            'Summary': issue.fields.summary,
-            'Status': issue.fields.status.name,
-            'Assignee': issue.fields.assignee.displayName if issue.fields.assignee else 'Unassigned',
-            'Reporter': issue.fields.reporter.displayName if issue.fields.reporter else 'Unknown',
-            'Priority': issue.fields.priority.name if issue.fields.priority else 'None',
-            'Created': issue.fields.created.split('T')[0],
-            'Description': issue.fields.description or 'No description provided'
-        }
-
-        return jsonify(ticket_details), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-if __name__ == '__main__':
-    app.run(debug=True)
+Tech Stack:
+Text Extraction/Embeddings/Summarization(Open AI-GPT-4o) 
+User Interface (React)
