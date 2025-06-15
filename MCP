@@ -1,3 +1,4 @@
+In the below MCP code, the mcp tools are not being executed. execute_mcp_tool is not executed. check the issue and fix it and provide the updated code. 
 ui.py code -
 import streamlit as st
 import requests
