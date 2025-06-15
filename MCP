@@ -1,0 +1,833 @@
+ui.py code -
+import streamlit as st
+import requests
+import json
+
+st.title("ReAct Agent Chat UI")
+
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# User input
+user_input = st.chat_input("Type your question and press Enter...")
+
+if user_input:
+    # Add user message to chat history
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Send to backend
+    try:
+        response = requests.post(
+            "http://127.0.0.1:8000/process_query",
+            json={"query": user_input},
+            headers={"Content-Type": "application/json"}
+        )
+        response_data = response.json()
+        print(f"resonse{response}")
+        # Format and display response
+        if "result" in response_data:
+            result = response_data["result"]
+            # Try to pretty print JSON if possible
+            try:
+                parsed = json.loads(result) if isinstance(result, str) else result
+                if isinstance(parsed, (dict, list)):
+                    formatted = f"```json\n{json.dumps(parsed, indent=2)}\n```"
+                else:
+                    formatted = str(result)
+            except Exception:
+                formatted = str(result)
+            st.session_state.messages.append({"role": "assistant", "content": formatted})
+            with st.chat_message("assistant"):
+                st.markdown(formatted)
+        elif "error" in response_data:
+            error = response_data["error"]
+            st.session_state.messages.append({"role": "assistant", "content": f"Error: {error}"})
+            with st.chat_message("assistant"):
+                st.markdown(f"Error: {error}")
+        else:
+            st.session_state.messages.append({"role": "assistant", "content": str(response_data)})
+            with st.chat_message("assistant"):
+                st.markdown(str(response_data))
+    except Exception as e:
+        error = f"Failed to connect to server: {str(e)}"
+        st.session_state.messages.append({"role": "assistant", "content": error})
+        with st.chat_message("assistant"):
+            st.markdown(error)
+--------------------------------------------------------------------
+ReAct_Agent.py code -
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.prompts import PromptTemplate
+from langchain.tools import Tool
+from langchain_core.language_models import BaseLLM
+from langchain_core.language_models.llms import LLMResult
+from langchain_core.outputs import Generation
+import requests
+import json
+import os
+from client import MCPToolAdapter
+import asyncio
+from typing import List, Optional
+from generate_token import generate_token
+import logging
+import sys
+
+# Remove all handlers associated with the root logger object.
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+app = FastAPI()
+
+class Query(BaseModel):
+    query: str
+
+# Move these to be generated per request
+OPENAI_API_URL = "https://bgt-app-bgpt.enbgai.prd.prd.bfsaws.net/v1/chat/completions"
+
+mcp_adapter = None
+
+async def get_mcp_adapter():
+    global mcp_adapter
+    if mcp_adapter is None:
+        server_params = {"command": "python", "args": ["server.py"], "env": None}
+        mcp_adapter = MCPToolAdapter(server_params)
+        await mcp_adapter.connect()
+    return mcp_adapter
+
+async def get_mcp_tools():
+    tools = []
+    try:
+        adapter = await get_mcp_adapter()
+        response = await adapter.list_tools()
+        
+        logging.debug(f"[MCP TOOLS] Raw response: {response}")
+        
+        # Handle different response formats from MCP
+        tool_list = []
+        if hasattr(response, 'tools'):
+            tool_list = response.tools
+        elif isinstance(response, list):
+            tool_list = response
+        elif isinstance(response, dict) and 'tools' in response:
+            tool_list = response['tools']
+        else:
+            logging.warning(f"[MCP TOOLS] Unexpected response format: {type(response)}")
+            return tools
+        
+        for tool in tool_list:
+            try:
+                # Handle both dict and object formats
+                if isinstance(tool, dict):
+                    name = tool.get('name')
+                    description = tool.get('description', '')
+                    input_schema = tool.get('inputSchema', {})
+                else:
+                    name = getattr(tool, 'name', None)
+                    description = getattr(tool, 'description', '')
+                    input_schema = getattr(tool, 'inputSchema', {})
+                
+                if name:
+                    # Include input schema information in description if available
+                    full_description = description
+                    if input_schema and isinstance(input_schema, dict):
+                        properties = input_schema.get('properties', {})
+                        if properties:
+                            params_info = ", ".join(properties.keys())
+                            full_description += f" (Parameters: {params_info})"
+                    
+                    tools.append({
+                        "name": name,
+                        "description": full_description,
+                        "input_schema": input_schema
+                    })
+                    logging.debug(f"[MCP TOOLS] Added tool: {name}")
+                else:
+                    logging.warning(f"[MCP TOOLS] Tool missing name: {tool}")
+            except Exception as e:
+                logging.error(f"[MCP TOOLS] Error processing tool {tool}: {e}")
+        
+        logging.info(f"[MCP TOOLS] Successfully loaded {len(tools)} tools: {[t['name'] for t in tools]}")
+    except Exception as e:
+        logging.error(f"[MCP TOOLS] Error getting tools: {e}")
+        import traceback
+        logging.error(f"[MCP TOOLS] Traceback: {traceback.format_exc()}")
+    
+    return tools
+
+# --- Custom LLM Implementation for LangChain ---
+class CustomOpenAILLM(BaseLLM):
+    """A custom LLM wrapper for OpenAI-compatible endpoints for LangChain."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "custom-openai-compatible"
+
+    def _generate(
+        self,
+        prompts: List[str],
+        stop: Optional[List[str]] = None,
+        run_manager=None,
+        **kwargs
+    ) -> LLMResult:
+        generations = []
+        for prompt in prompts:
+            # Generate fresh token for each request
+            api_key = generate_token()
+            headers = {
+                "Content-Type": "application/json",
+                "applicationType": "BRProduct",
+                "Authorization": f"Bearer {api_key}"
+            }
+            data = {
+                "messages": [{"role": "user", "content": prompt}],
+                "model": "o1",
+                "max_tokens": 5000,
+            }
+            
+            try:
+                logging.debug(f"Making request to {OPENAI_API_URL}")
+                logging.debug(f"Headers: {headers}")
+                logging.debug(f"Data: {json.dumps(data, indent=2)}")
+                
+                response = requests.post(
+                    OPENAI_API_URL, 
+                    json=data, 
+                    headers=headers,
+                    timeout=30  # Add timeout
+                )
+                
+                logging.debug(f"Response status: {response.status_code}")
+                logging.debug(f"Response headers: {response.headers}")
+                logging.debug(f"Response text: {response.text}")
+                
+                if response.status_code == 200:
+                    response_data = response.json()
+                    answer = response_data["choices"][0]["message"]["content"]
+                    generations.append([Generation(text=answer)])
+                else:
+                    error_msg = f"HTTP {response.status_code}: {response.text}"
+                    logging.error(f"API Error: {error_msg}")
+                    raise Exception(f"Error in Processing: {error_msg}")
+                    
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Request Exception: {e}")
+                raise Exception(f"Network Error: {str(e)}")
+            except Exception as e:
+                logging.error(f"General Exception: {e}")
+                raise
+                
+        return LLMResult(generations=generations)
+
+# --- Execute MCP Tool ---
+async def execute_mcp_tool(tool_name, parameters):
+    logging.info(f"[AGENT] execute_mcp_tool called for: {tool_name} with params: {parameters}")
+    try:
+        adapter = await get_mcp_adapter()
+        result = await adapter.execute_tool(tool_name, parameters)
+        logging.debug(f"[MCP TOOL] Executed {tool_name} with params {parameters}, result: {result}")
+        return result
+    except Exception as e:
+        logging.error(f"[MCP TOOL] Error executing {tool_name}: {e}")
+        raise
+
+# --- Agent Setup ---
+async def setup_agent():
+    mcp_tools_list = await get_mcp_tools()
+    
+    if not mcp_tools_list:
+        logging.warning("[AGENT] No MCP tools available!")
+        return None, "", ""
+
+    def make_tool_func(tool_name):
+        async def async_tool_func(params_input):
+            try:
+                # Parse input parameters
+                if isinstance(params_input, str):
+                    try:
+                        params = json.loads(params_input)
+                    except json.JSONDecodeError:
+                        params = {"input": params_input}
+                elif isinstance(params_input, dict):
+                    params = params_input
+                else:
+                    params = {"input": str(params_input)}
+                
+                logging.debug(f"[TOOL] Calling {tool_name} with params: {params}")
+                result = await execute_mcp_tool(tool_name, params)
+                
+                # Format result for LangChain
+                if isinstance(result, dict):
+                    return json.dumps(result, indent=2)
+                else:
+                    return str(result)
+                    
+            except Exception as e:
+                error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                logging.error(f"[TOOL] {error_msg}")
+                return error_msg
+        
+        return async_tool_func
+
+    # Create LangChain tools
+    tools = []
+    for tool in mcp_tools_list:
+        try:
+            langchain_tool = Tool(
+                name=tool["name"],
+                func=make_tool_func(tool["name"]),
+                description=tool["description"]
+            )
+            tools.append(langchain_tool)
+            logging.debug(f"[AGENT] Created LangChain tool: {tool['name']}")
+        except Exception as e:
+            logging.error(f"[AGENT] Error creating tool {tool['name']}: {e}")
+
+    if not tools:
+        logging.error("[AGENT] No valid tools created!")
+        return None, "", ""
+
+    # Prepare tool_names and tools_str for the prompt
+    tool_names = ", ".join([tool.name for tool in tools])
+    tools_str = "\n".join([f"{tool.name}: {tool.description}" for tool in tools])
+
+    llm = CustomOpenAILLM()
+    
+    # Use the correct PromptTemplate instantiation for LangChain
+    prompt = PromptTemplate(
+        template=(
+            "Answer the following questions as best you can. You have access to the following tools:\n\n{tools}\n\n"
+            "Use the following format:\n\n"
+            "Question: the input question you must answer\n"
+            "Thought: you should always think about what to do\n"
+            "Action: the action to take, should be one of [{tool_names}]\n"
+            "Action Input: the input to the action\n"
+            "Observation: the result of the action\n"
+            "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
+            "Thought: I now know the final answer\n"
+            "Final Answer: the final answer to the original input question\n\n"
+            "IMPORTANT:\n"
+            "- When you get a result from a tool, use that result as your final answer without modification\n"
+            "- Do not generate additional content beyond what the tool returns\n"
+            "- Present the tool result exactly as received\n"
+            "Begin!\n\n"
+            "Question: {input}\n"
+            "Thought:{agent_scratchpad}"
+        ),
+        input_variables=["tools", "tool_names", "input", "agent_scratchpad"]
+    )
+    
+    agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    
+    logging.info(f"[AGENT] Agent setup complete with {len(tools)} tools")
+    return agent_executor, tool_names, tools_str
+
+@app.post("/process_query")
+async def process_query(query: Query, request: Request):
+    try:
+        logging.info(f"[DEBUG] Received user query: {query.query}")
+        logging.info(f"[DEBUG] Request headers: {dict(request.headers)}")
+        
+        agent_executor, tool_names, tools_str = await setup_agent()
+        
+        if not agent_executor:
+            return {"error": "Failed to setup agent - no tools available"}
+        
+        logging.debug("[DEBUG] Agent setup complete. Invoking agent...")
+        
+        result = await agent_executor.ainvoke({
+            "input": query.query,
+            "tools": tools_str,
+            "tool_names": tool_names,
+            "agent_scratchpad": ""
+        })
+        
+        logging.debug(f"[DEBUG] Agent invocation result: {result}")
+        
+        # Extract the output properly
+        if isinstance(result, dict):
+            if "output" in result:
+                logging.debug("[DEBUG] Returning 'output' from result dict.")
+                return {"result": result["output"]}
+            elif "result" in result:
+                logging.debug("[DEBUG] Returning 'result' from result dict.")
+                return {"result": result["result"]}
+            else:
+                # Return the first non-input value
+                for key, value in result.items():
+                    if key != "input":
+                        logging.debug(f"[DEBUG] Returning first non-input key from result dict: {key}")
+                        return {"result": value}
+        
+        logging.debug("[DEBUG] Returning stringified result.")
+        return {"result": str(result)}
+        
+    except Exception as e:
+        logging.error(f"[ERROR] Exception in /process_query: {e}")
+        import traceback
+        logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
+        return {"error": f"Failed to process query: {str(e)}"}
+
+# Add a test endpoint to verify API connectivity
+@app.post("/test_api")
+async def test_api():
+    """Test endpoint to verify API connectivity"""
+    try:
+        api_key = generate_token()
+        headers = {
+            "Content-Type": "application/json",
+            "applicationType": "BRProduct",
+            "Authorization": f"Bearer {api_key}"
+        }
+        data = {
+            "messages": [{"role": "user", "content": "Hello, are you working?"}],
+            "model": "o1",
+            "max_tokens": 5000,
+        }
+        
+        response = requests.post(OPENAI_API_URL, json=data, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            answer = response_data["choices"][0]["message"]["content"]
+            return {"status": "success", "response": answer}
+        else:
+            return {
+                "status": "error", 
+                "status_code": response.status_code,
+                "error": response.text
+            }
+            
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+# Add a test endpoint for MCP tools
+@app.get("/test_mcp")
+async def test_mcp():
+    """Test endpoint to verify MCP connectivity"""
+    try:
+        tools = await get_mcp_tools()
+        return {
+            "status": "success",
+            "tools_count": len(tools),
+            "tools": [{"name": t["name"], "description": t["description"]} for t in tools]
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.get("/")
+async def root():
+    return {"message": "LangChain ReAct Agent API. Use POST /process_query with a JSON body containing a query string."}
+--------------------------------------------------------------------
+client.py code -
+import sys
+import os
+import importlib.util
+from typing import Dict, Any, List
+import logging
+
+class MCPToolAdapter:
+    def __init__(self, server_params):
+        self.server_params = server_params
+        self.server_module = None
+        self.mcp_instance = None
+        self.connected = False
+    
+    async def connect(self):
+        """Connect to the MCP server by importing the server module"""
+        try:
+            # Get the server file path
+            server_file = None
+            args = self.server_params.get("args", [])
+            
+            if args:
+                server_file = args[0]  # Assuming first arg is the server file
+            else:
+                server_file = "server.py"  # Default
+            
+            # Import the server module
+            if not os.path.exists(server_file):
+                raise FileNotFoundError(f"Server file not found: {server_file}")
+            
+            spec = importlib.util.spec_from_file_location("mcp_server", server_file)
+            self.server_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.server_module)
+            
+            # Get the MCP instance
+            if hasattr(self.server_module, 'mcp'):
+                self.mcp_instance = self.server_module.mcp
+                self.connected = True
+                logging.info("Successfully connected to MCP server")
+            else:
+                raise Exception("No 'mcp' instance found in server module")
+                
+        except Exception as e:
+            raise Exception(f"Failed to connect to MCP server: {e}")
+    
+    async def list_tools(self):
+        """List available tools from the MCP server"""
+        if not self.connected or not self.mcp_instance:
+            raise ValueError("Client not connected")
+        
+        try:
+            tools = []
+            
+            # Debug: Print all attributes of the mcp_instance
+            logging.debug(f"MCP instance type: {type(self.mcp_instance)}")
+            logging.debug(f"MCP instance attributes: {dir(self.mcp_instance)}")
+            
+            # Try different ways to access tools from FastMCP
+            possible_tool_attrs = ['_tools', 'tools', '_tool_registry', 'tool_registry', '_handlers']
+            
+            for attr in possible_tool_attrs:
+                if hasattr(self.mcp_instance, attr):
+                    tool_data = getattr(self.mcp_instance, attr)
+                    logging.debug(f"Found attribute '{attr}': {type(tool_data)} - {tool_data}")
+                    
+                    if isinstance(tool_data, dict):
+                        for tool_name, tool_info in tool_data.items():
+                            logging.debug(f"Processing tool: {tool_name} - {type(tool_info)} - {tool_info}")
+                            
+                            # Handle different tool info formats
+                            if isinstance(tool_info, dict):
+                                description = tool_info.get("description", "")
+                                input_schema = tool_info.get("inputSchema", {})
+                            elif hasattr(tool_info, '__dict__'):
+                                # Tool info is an object
+                                description = getattr(tool_info, 'description', '')
+                                input_schema = getattr(tool_info, 'inputSchema', {})
+                            else:
+                                # Try to get description from the function docstring
+                                description = ""
+                                input_schema = {}
+                                if hasattr(tool_info, '__doc__') and tool_info.__doc__:
+                                    description = tool_info.__doc__.strip()
+                            
+                            tools.append({
+                                "name": tool_name,
+                                "description": description,
+                                "inputSchema": input_schema
+                            })
+                        break
+            
+            # If no tools found through attributes, try to access the server's registered tools directly
+            if not tools and hasattr(self.server_module, '__dict__'):
+                # Look for decorated functions in the module
+                for name, obj in self.server_module.__dict__.items():
+                    if callable(obj) and hasattr(obj, '__name__'):
+                        # Check if it's a tool function (ends with _tool)
+                        if name.endswith('_tool'):
+                            tools.append({
+                                "name": name.replace('_tool', '').replace('_', ' ').title(),
+                                "description": obj.__doc__ or f"Tool function: {name}",
+                                "inputSchema": {}
+                            })
+            
+            logging.info(f"Found {len(tools)} tools: {[t['name'] for t in tools]}")
+            return tools
+            
+        except Exception as e:
+            logging.error(f"Error in list_tools: {e}")
+            raise Exception(f"Failed to list tools: {e}")
+    
+    async def execute_tool(self, tool_name: str, parameters: Dict[str, Any]):
+        """Execute a tool with given parameters"""
+        logging.info(f"[MCP CLIENT] execute_tool called for: {tool_name} with params: {parameters}")
+        if not self.connected or not self.mcp_instance:
+            raise ValueError("Client not connected")
+        
+        try:
+            logging.debug(f"Attempting to execute tool: {tool_name} with params: {parameters}")
+            
+            # Try to find the tool function in different ways
+            tool_func = None
+            
+            # Method 1: Check if it's in the _tools registry
+            if hasattr(self.mcp_instance, '_tools') and tool_name in self.mcp_instance._tools:
+                tool_info = self.mcp_instance._tools[tool_name]
+                if isinstance(tool_info, dict) and "func" in tool_info:
+                    tool_func = tool_info["func"]
+                elif callable(tool_info):
+                    tool_func = tool_info
+            
+            # Method 2: Look for the function directly in the server module
+            if not tool_func:
+                # Convert tool name to function name (e.g., "Hello World Tool" -> "hello_world_tool")
+                func_name = tool_name.lower().replace(' ', '_') + '_tool'
+                if hasattr(self.server_module, func_name):
+                    tool_func = getattr(self.server_module, func_name)
+                    logging.debug(f"Found tool function: {func_name}")
+            
+            # Method 3: Try exact name match
+            if not tool_func and hasattr(self.server_module, tool_name):
+                tool_func = getattr(self.server_module, tool_name)
+            
+            # Method 4: Search through all functions with _tool suffix
+            if not tool_func:
+                for attr_name in dir(self.server_module):
+                    if attr_name.endswith('_tool'):
+                        func = getattr(self.server_module, attr_name)
+                        if callable(func):
+                            # Check if this might be our tool by comparing names
+                            clean_attr_name = attr_name.replace('_tool', '').replace('_', ' ').title()
+                            if clean_attr_name.lower() == tool_name.lower():
+                                tool_func = func
+                                logging.debug(f"Found tool function by matching: {attr_name}")
+                                break
+            
+            if not tool_func:
+                available_tools = []
+                if hasattr(self.mcp_instance, '_tools'):
+                    available_tools = list(self.mcp_instance._tools.keys())
+                else:
+                    available_tools = [name for name in dir(self.server_module) if name.endswith('_tool')]
+                raise Exception(f"Tool {tool_name} not found. Available tools: {available_tools}")
+            
+            # Call the tool function with parameters
+            try:
+                import inspect
+                sig = inspect.signature(tool_func)
+                
+                if len(sig.parameters) == 1:
+                    # Single parameter - use the first value or 'input' key
+                    if "input" in parameters:
+                        result = tool_func(parameters["input"])
+                    elif len(parameters) == 1:
+                        result = tool_func(list(parameters.values())[0])
+                    else:
+                        # Try to find a suitable parameter
+                        param_name = list(sig.parameters.keys())[0]
+                        if param_name in parameters:
+                            result = tool_func(parameters[param_name])
+                        else:
+                            # Default to empty string or first parameter value
+                            result = tool_func(list(parameters.values())[0] if parameters else "")
+                else:
+                    # Multiple parameters - pass as kwargs
+                    result = tool_func(**parameters)
+                
+                logging.info(f"Tool {tool_name} executed successfully")
+                return result
+                
+            except TypeError as e:
+                logging.error(f"Parameter mismatch for tool {tool_name}: {e}")
+                # Try alternative parameter passing
+                if parameters:
+                    result = tool_func(str(parameters))
+                else:
+                    result = tool_func()
+                return result
+                
+        except Exception as e:
+            logging.error(f"Error executing tool {tool_name}: {e}")
+            raise Exception(f"Failed to execute tool {tool_name}: {e}")
+    
+    async def close(self):
+        """Close the MCP client session"""
+        self.connected = False
+        self.mcp_instance = None
+        self.server_module = None
+        logging.info("MCP client session closed")
+------------------------------------------------
+server.py code -
+from mcp.server.fastmcp import FastMCP
+import requests
+from typing import Dict, Any
+
+# Create an MCP server instance
+mcp = FastMCP("BRApplicationServer")
+
+@mcp.tool(
+    name="Configuration Workstream",
+    description="""
+    The Configuration Tool assists users in understanding and managing the Impact application's functionality setup, which is governed by a system of Taskcommon switches (TC). These switches control various features within the Impact platform.
+
+    The Configuration tool provides detailed information about each Taskcommon switch, including:
+    - The switch's current state (position)
+    - Full name
+    - Descriptive summary of its purpose
+    - Short Name (an abbreviated identifier for quick reference)
+    - Associated Work Group and Work Area
+
+    This information helps users comprehensively understand how each switch affects application behavior. 
+
+    In addition to offering reference details, the Configuration tool enables users to:
+    - Query and retrieve specific Taskcommon switch configurations for individual Impact clients
+    - Display current client-specific switch setups
+    - Support administrators and support teams in troubleshooting, auditing, or optimizing configurations based on client requirements
+
+    Overall, the Configuration tool streamlines management of the Impact application by offering insights and control over Taskcommon switches and by facilitating efficient handling of client-specific configurations.
+    """
+)
+def configuration_workstream_tool(question: str) -> Dict[str, Any]:
+    """
+    Answer queries about Taskcommon switches or client-specific configuration in the Impact application.
+
+    Args:
+        question (str): User's request about Taskcommon switch details (such as state, purpose, or group) or how switches are set for a specific client.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing 'filtered_data' (JSON-encoded string of switch details)
+                        and 'response_text' (human-readable answer).
+    """
+
+    url = "http://jsqpvwaiw01:8889/cw_get_response"
+    payload = {"question": question}
+    try:
+        response = requests.post(url, json=payload, timeout=90)
+        print(f"Inside server.py and response is ---- {response}")
+        response.raise_for_status()
+        try:
+            result = response.json()
+            import logging
+            logging.info(f"[MCP TOOL] configuration_workstream_tool output: {result}")
+            return result
+        except Exception as e:
+            return {"error": f"Failed to parse JSON response: {str(e)}", "raw_response": response.text}
+    except requests.RequestException as e:
+        return {"error": f"Request failed: {str(e)}"}
+
+@mcp.tool(
+    name="Conversion Methodology",
+    description="""
+    The AI Conversion Methodology tool assists Broadridge Conversion SMEs by providing:
+    - Access to historical conversion data and methodology implementation insights
+    - Identification of required input and output files for methodology development
+    - Automated generation of standardized, professional requirements documents for clients
+    - Accurate mapping of data conversion from legacy systems (covering positions, trades, etc.)
+    - Workstream-specific guidance and cross-workstream collaboration alerts
+
+    This tool accelerates and standardizes client onboarding by leveraging AI to reduce manual effort, enhance documentation consistency, and streamline data conversion processes using historical data.
+    """
+)
+def conversion_methodology_tool(question: str) -> Dict[str, Any]:
+    """
+    Answer queries regarding Broadridge conversion methodology, historical data, workstream requirements, or onboarding documentation.
+
+    Args:
+        question (str): User's inquiry about conversion methodology details, required files, historical data, or documentation needs.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing:
+            - 'filtered_data': str
+                A JSON-encoded string of relevant conversion records or data for the request.
+            - 'response_text': str
+                A human-readable, concise explanation or summary answering the user's query, possibly with suggested next prompts.
+    """
+    url = "http://jsqpvwaiw01:8889/cm_get_response"
+    payload = {"question": question}
+    try:
+        response = requests.post(url, json=payload, timeout=90)
+        response.raise_for_status()
+        try:
+            result = response.json()
+            import logging
+            logging.info(f"[MCP TOOL] conversion_methodology_tool output: {result}")
+            return result
+        except Exception as e:
+            return {"error": f"Failed to parse JSON response: {str(e)}", "raw_response": response.text}
+    except requests.RequestException as e:
+        return {"error": f"Request failed: {str(e)}"}
+
+@mcp.tool(
+    name="Test Cases Generator",
+    description="""
+    The Test Cases Generator tool takes user input (such as requirements, user stories, or acceptance criteria) and generates detailed test cases. It leverages an external service to produce structured test cases for QA and development teams.
+    """
+)
+def test_cases_generator_tool(user_input: str) -> Dict[str, Any]:
+    """
+    Generate test cases from user input (requirements, user stories, etc.) using an external API.
+
+    Args:
+        user_input (str): The requirements, user story, or acceptance criteria provided by the user.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing a 'testCases' key with a list of test case dicts, or error information.
+    """
+    url = 'http://localhost:5000/jira/generate-test-cases'
+    payload = {'description': user_input}
+    try:
+        response = requests.post(url, json=payload, timeout=60)  # Now with timeout!
+        if response.status_code == 200:
+            json_response = response.json()
+            import logging
+            logging.info(f"[MCP TOOL] test_cases_generator_tool output: {json_response}")
+            # Check if the response contains test cases
+            if 'testCases' in json_response and isinstance(json_response['testCases'], list):
+                return {'testCases': json_response['testCases']}
+            else:
+                return {'error': 'No test cases found in the response.', 'raw_response': json_response}
+        else:
+            return {'error': f'Failed to generate test cases. Status code: {response.status_code}'}
+    except requests.exceptions.Timeout:
+        return {'error': 'Test case generator service timed out! Try again later.'}
+    except requests.exceptions.RequestException as e:
+        return {'error': f'An error occurred: {e}'}
+
+@mcp.tool(
+    name="Hello World Tool",
+    description="A simple tool that returns a hardcoded greeting. Only responds to greeting messages like 'hi', 'hello', or similar."
+)
+def hello_world_tool(user_input: str = "") -> Dict[str, Any]:
+    """
+    Returns a hardcoded greeting message if the input is a greeting.
+    """
+    greetings = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"]
+    import logging
+    if any(greet in user_input.lower() for greet in greetings):
+        result = {"message": "Hello from the MCP server tool!"}
+        logging.info(f"[MCP TOOL] hello_world_tool output: {result}")
+        return result
+    else:
+        result = {"message": "This tool only responds to greeting messages like 'hi', 'hello', etc."}
+        logging.info(f"[MCP TOOL] hello_world_tool output: {result}")
+        return result
+
+# # Standalone test function for local debugging (not an MCP tool)
+# def generate_test_cases():
+#     url = 'http://localhost:5000/jira/generate-test-cases'
+#     payload = {
+#         'description': 'A new trade date field has been added to transaction entry screen'
+#     }
+#     try:
+#         # Send POST request
+#         response = requests.post(url, json=payload)
+
+#         # Check if request was successful
+#         if response.status_code == 200:
+#             json_response = response.json()
+#             print('JSON Response:', json_response)
+
+#             # Check if the response contains test cases
+#             if 'testCases' in json_response and isinstance(json_response['testCases'], list):
+#                 print('Generated Test Cases:', json_response['testCases'])
+#             else:
+#                 print('No test cases found in the response.')
+#         else:
+#             print('Failed to generate test cases. Status code:', response.status_code)
+
+#     except requests.exceptions.RequestException as e:
+#         print('An error occurred:', e)
+
+# Run the server
+if __name__ == "__main__":
+     mcp.run(transport="stdio")
+    # Uncomment the line below to run the standalone test function
+    # generate_test_cases()
+
