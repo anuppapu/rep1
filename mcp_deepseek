@@ -11,10 +11,11 @@ import json
 import os
 from client import MCPToolAdapter
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from generate_token import generate_token
 import logging
 import sys
+import time
 
 # Remove all handlers associated with the root logger object.
 for handler in logging.root.handlers[:]:
@@ -31,10 +32,15 @@ app = FastAPI()
 class Query(BaseModel):
     query: str
 
-# Move these to be generated per request
+# Configuration
 OPENAI_API_URL = "https://bgt-app-bgpt.enbgai.prd.prd.bfsaws.net/v1/chat/completions"
+REQUEST_TIMEOUT = 120  # Increased timeout to 120 seconds
+TOKEN_EXPIRY = 3600  # 1 hour token expiry
 
+# Global state
 mcp_adapter = None
+api_token = None
+token_generation_time = 0
 
 async def get_mcp_adapter():
     global mcp_adapter
@@ -44,7 +50,18 @@ async def get_mcp_adapter():
         await mcp_adapter.connect()
     return mcp_adapter
 
-async def get_mcp_tools():
+def get_api_token() -> str:
+    global api_token, token_generation_time
+    current_time = time.time()
+    
+    # Regenerate token if expired or not exists
+    if api_token is None or (current_time - token_generation_time) > TOKEN_EXPIRY:
+        logging.info("Generating new API token")
+        api_token = generate_token()
+        token_generation_time = current_time
+    return api_token
+
+async def get_mcp_tools() -> List[dict]:
     tools = []
     try:
         adapter = await get_mcp_adapter()
@@ -66,7 +83,6 @@ async def get_mcp_tools():
         
         for tool in tool_list:
             try:
-                # Handle both dict and object formats
                 if isinstance(tool, dict):
                     name = tool.get('name')
                     description = tool.get('description', '')
@@ -77,7 +93,6 @@ async def get_mcp_tools():
                     input_schema = getattr(tool, 'inputSchema', {})
                 
                 if name:
-                    # Include input schema information in description if available
                     full_description = description
                     if input_schema and isinstance(input_schema, dict):
                         properties = input_schema.get('properties', {})
@@ -90,24 +105,16 @@ async def get_mcp_tools():
                         "description": full_description,
                         "input_schema": input_schema
                     })
-                    logging.debug(f"[MCP TOOLS] Added tool: {name}")
-                else:
-                    logging.warning(f"[MCP TOOLS] Tool missing name: {tool}")
             except Exception as e:
                 logging.error(f"[MCP TOOLS] Error processing tool {tool}: {e}")
         
-        logging.info(f"[MCP TOOLS] Successfully loaded {len(tools)} tools: {[t['name'] for t in tools]}")
+        logging.info(f"[MCP TOOLS] Successfully loaded {len(tools)} tools")
     except Exception as e:
         logging.error(f"[MCP TOOLS] Error getting tools: {e}")
-        import traceback
-        logging.error(f"[MCP TOOLS] Traceback: {traceback.format_exc()}")
     
     return tools
 
-# --- Custom LLM Implementation for LangChain ---
 class CustomOpenAILLM(BaseLLM):
-    """A custom LLM wrapper for OpenAI-compatible endpoints for LangChain."""
-
     @property
     def _llm_type(self) -> str:
         return "custom-openai-compatible"
@@ -120,14 +127,13 @@ class CustomOpenAILLM(BaseLLM):
         **kwargs
     ) -> LLMResult:
         generations = []
+        headers = {
+            "Content-Type": "application/json",
+            "applicationType": "BRProduct",
+            "Authorization": f"Bearer {get_api_token()}"
+        }
+        
         for prompt in prompts:
-            # Generate fresh token for each request
-            api_key = generate_token()
-            headers = {
-                "Content-Type": "application/json",
-                "applicationType": "BRProduct",
-                "Authorization": f"Bearer {api_key}"
-            }
             data = {
                 "messages": [{"role": "user", "content": prompt}],
                 "model": "o1",
@@ -135,20 +141,12 @@ class CustomOpenAILLM(BaseLLM):
             }
             
             try:
-                logging.debug(f"Making request to {OPENAI_API_URL}")
-                logging.debug(f"Headers: {headers}")
-                logging.debug(f"Data: {json.dumps(data, indent=2)}")
-                
                 response = requests.post(
                     OPENAI_API_URL, 
                     json=data, 
                     headers=headers,
-                    timeout=30  # Add timeout
+                    timeout=REQUEST_TIMEOUT
                 )
-                
-                logging.debug(f"Response status: {response.status_code}")
-                logging.debug(f"Response headers: {response.headers}")
-                logging.debug(f"Response text: {response.text}")
                 
                 if response.status_code == 200:
                     response_data = response.json()
@@ -159,6 +157,10 @@ class CustomOpenAILLM(BaseLLM):
                     logging.error(f"API Error: {error_msg}")
                     raise Exception(f"Error in Processing: {error_msg}")
                     
+            except requests.exceptions.Timeout:
+                error_msg = f"Request timed out after {REQUEST_TIMEOUT} seconds"
+                logging.error(error_msg)
+                raise Exception(error_msg)
             except requests.exceptions.RequestException as e:
                 logging.error(f"Request Exception: {e}")
                 raise Exception(f"Network Error: {str(e)}")
@@ -168,94 +170,76 @@ class CustomOpenAILLM(BaseLLM):
                 
         return LLMResult(generations=generations)
 
-# --- Execute MCP Tool ---
-async def execute_mcp_tool(tool_name, parameters):
-    logging.info(f"[AGENT] execute_mcp_tool called for: {tool_name} with params: {parameters}")
+async def execute_mcp_tool(tool_name: str, parameters: dict) -> str:
     try:
         adapter = await get_mcp_adapter()
         result = await adapter.execute_tool(tool_name, parameters)
-        logging.debug(f"[MCP TOOL] Executed {tool_name} with params {parameters}, result: {result}")
-        return str(result)  # Ensure result is stringified for LangChain
+        return str(result)
+    except asyncio.TimeoutError:
+        error_msg = f"Tool execution timed out for {tool_name}"
+        logging.error(error_msg)
+        return error_msg
     except Exception as e:
-        logging.error(f"[MCP TOOL] Error executing {tool_name}: {e}")
-        return f"Error executing tool {tool_name}: {str(e)}"
+        error_msg = f"Error executing tool {tool_name}: {str(e)}"
+        logging.error(error_msg)
+        return error_msg
 
-# --- Agent Setup ---
-async def setup_agent():
+async def setup_agent() -> Tuple[Optional[AgentExecutor], str, str]:
     mcp_tools_list = await get_mcp_tools()
     
     if not mcp_tools_list:
-        logging.warning("[AGENT] No MCP tools available!")
+        logging.warning("No MCP tools available!")
         return None, "", ""
 
-    def make_tool_func(tool_name):
-        async def async_tool_func(params_input):
+    def make_tool_func(tool_name: str):
+        async def async_tool_func(params_input: str) -> str:
             try:
-                # Parse input parameters
-                if isinstance(params_input, str):
-                    try:
-                        params = json.loads(params_input)
-                    except json.JSONDecodeError:
-                        params = {"input": params_input}
-                elif isinstance(params_input, dict):
-                    params = params_input
-                else:
-                    params = {"input": str(params_input)}
-                
-                logging.debug(f"[TOOL] Calling {tool_name} with params: {params}")
-                result = await execute_mcp_tool(tool_name, params)
-                return result
+                params = json.loads(params_input) if isinstance(params_input, str) else params_input
+                return await execute_mcp_tool(tool_name, params)
             except Exception as e:
-                error_msg = f"Error executing tool {tool_name}: {str(e)}"
-                logging.error(f"[TOOL] {error_msg}")
-                return error_msg
+                return f"Error executing tool {tool_name}: {str(e)}"
         
         return async_tool_func
 
-    # Create LangChain tools
     tools = []
     for tool in mcp_tools_list:
         try:
-            langchain_tool = Tool(
+            tools.append(Tool(
                 name=tool["name"],
                 func=make_tool_func(tool["name"]),
                 description=tool["description"],
-                coroutine=make_tool_func(tool["name"])  # Ensure async support
-            )
-            tools.append(langchain_tool)
-            logging.debug(f"[AGENT] Created LangChain tool: {tool['name']}")
+                coroutine=make_tool_func(tool["name"])
+            ))
         except Exception as e:
-            logging.error(f"[AGENT] Error creating tool {tool['name']}: {e}")
+            logging.error(f"Error creating tool {tool['name']}: {e}")
 
     if not tools:
-        logging.error("[AGENT] No valid tools created!")
+        logging.error("No valid tools created!")
         return None, "", ""
 
-    # Prepare tool_names and tools_str for the prompt
     tool_names = ", ".join([tool.name for tool in tools])
     tools_str = "\n".join([f"{tool.name}: {tool.description}" for tool in tools])
 
     llm = CustomOpenAILLM()
     
-    # Updated prompt to enforce tool usage
     prompt = PromptTemplate(
         template=(
-            "Answer the following questions as best you can. You have access to the following tools:\n\n{tools}\n\n"
-            "Use the following format:\n\n"
-            "Question: the input question you must answer\n"
-            "Thought: you should always think about what to do\n"
-            "Action: the action to take, should be one of [{tool_names}]\n"
-            "Action Input: the input to the action (must be valid JSON)\n"
-            "Observation: the result of the action\n"
-            "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
-            "Thought: I now know the final answer\n"
-            "Final Answer: the final answer to the original input question\n\n"
-            "IMPORTANT RULES:\n"
-            "1. You MUST use one of the available tools to answer the question\n"
-            "2. You MUST return the exact output from the tool without modification\n"
-            "3. If the tool returns an error, return the error message exactly as received\n"
-            "4. Never make up answers - if no tool can answer, say 'No suitable tool available'\n"
-            "5. The Action Input MUST be valid JSON that matches the tool's expected parameters\n\n"
+            "Answer questions using these tools:\n\n{tools}\n\n"
+            "Format:\n"
+            "Question: input question\n"
+            "Thought: think about action\n"
+            "Action: tool name from [{tool_names}]\n"
+            "Action Input: valid JSON input\n"
+            "Observation: tool result\n"
+            "... (repeat if needed)\n"
+            "Thought: final answer\n"
+            "Final Answer: exact tool output\n\n"
+            "RULES:\n"
+            "1. MUST use tools to answer\n"
+            "2. Return EXACT tool output\n"
+            "3. Action Input MUST be valid JSON\n"
+            "4. If error, return it exactly\n"
+            "5. If no tool, say 'No suitable tool'\n\n"
             "Begin!\n\n"
             "Question: {input}\n"
             "Thought:{agent_scratchpad}"
@@ -269,23 +253,20 @@ async def setup_agent():
         tools=tools, 
         verbose=True,
         handle_parsing_errors=True,
-        return_intermediate_steps=True
+        return_intermediate_steps=True,
+        max_iterations=5,
+        early_stopping_method="generate"
     )
     
-    logging.info(f"[AGENT] Agent setup complete with {len(tools)} tools")
     return agent_executor, tool_names, tools_str
 
 @app.post("/process_query")
 async def process_query(query: Query, request: Request):
     try:
-        logging.info(f"[DEBUG] Received user query: {query.query}")
-        
         agent_executor, tool_names, tools_str = await setup_agent()
         
         if not agent_executor:
-            return {"error": "Failed to setup agent - no tools available"}
-        
-        logging.debug("[DEBUG] Agent setup complete. Invoking agent...")
+            return {"error": "No tools available"}
         
         result = await agent_executor.ainvoke({
             "input": query.query,
@@ -294,34 +275,23 @@ async def process_query(query: Query, request: Request):
             "agent_scratchpad": ""
         })
         
-        logging.debug(f"[DEBUG] Agent invocation result: {result}")
-        
-        # Extract the output properly
         if isinstance(result, dict):
             if "output" in result:
                 output = result["output"]
-                # If we have intermediate steps, check if tools were actually used
-                if "intermediate_steps" in result and result["intermediate_steps"]:
-                    last_step = result["intermediate_steps"][-1]
-                    if isinstance(last_step, tuple) and len(last_step) >= 2:
-                        tool_output = last_step[1]
-                        if tool_output:
-                            output = tool_output
+                if "intermediate_steps" in result:
+                    for step in result["intermediate_steps"]:
+                        if isinstance(step, tuple) and len(step) >= 2:
+                            tool_output = step[1]
+                            if tool_output:
+                                output = tool_output
+                                break
                 return {"result": output}
-            elif "result" in result:
-                return {"result": result["result"]}
-            else:
-                # Return the first non-input value
-                for key, value in result.items():
-                    if key != "input":
-                        return {"result": value}
+            return {"result": str(result)}
         
         return {"result": str(result)}
         
     except Exception as e:
-        logging.error(f"[ERROR] Exception in /process_query: {e}")
-        import traceback
-        logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
+        logging.error(f"Error processing query: {e}")
         return {"error": f"Failed to process query: {str(e)}"}
 
-# ... (rest of the file remains the same)
+# ... (rest of the endpoints remain the same)
