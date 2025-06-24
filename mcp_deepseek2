@@ -1,260 +1,54 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.prompts import PromptTemplate
-from langchain.tools import Tool
-from langchain_core.language_models import BaseLLM
-from langchain_core.language_models.llms import LLMResult
-from langchain_core.outputs import Generation
-import requests
-import json
-import os
-from client import MCPToolAdapter
-import asyncio
-from typing import List, Optional, Tuple
-from generate_token import generate_token
-import logging
-import sys
-import time
-from functools import wraps
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
-
-app = FastAPI()
-
-class Query(BaseModel):
-    query: str
-
-# Constants
-OPENAI_API_URL = "https://bgt-app-bgpt.enbgai.prd.prd.bfsaws.net/v1/chat/completions"
-REQUEST_TIMEOUT = 120  # Increased timeout to 120 seconds
-TOKEN_EXPIRY = 3600  # 1 hour token expiry
-MAX_LLM_INVOCATIONS = 3  # Maximum LLM calls per query
-TOOL_EXECUTION_TIMEOUT = 90  # Timeout for MCP tool execution
-
-# Global state
-mcp_adapter = None
-api_token = None
-token_generation_time = 0
-llm_invocation_count = 0  # Track LLM calls per query
-
-def reset_llm_counter():
-    global llm_invocation_count
-    llm_invocation_count = 0
-
-def timeout_handler(max_timeout):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            try:
-                return await asyncio.wait_for(func(*args, **kwargs), timeout=max_timeout)
-            except asyncio.TimeoutError:
-                logger.error(f"Operation timed out after {max_timeout} seconds")
-                raise
-        return wrapper
-    return decorator
-
-async def get_mcp_adapter():
-    global mcp_adapter
-    if mcp_adapter is None:
-        server_params = {"command": "python", "args": ["server.py"], "env": None}
-        mcp_adapter = MCPToolAdapter(server_params)
-        await mcp_adapter.connect()
-    return mcp_adapter
-
-def get_api_token() -> str:
-    global api_token, token_generation_time
-    current_time = time.time()
-    
-    if api_token is None or (current_time - token_generation_time) > TOKEN_EXPIRY:
-        logger.info("Generating new API token")
-        api_token = generate_token()
-        token_generation_time = current_time
-    return api_token
-
-@timeout_handler(TOOL_EXECUTION_TIMEOUT)
-async def execute_mcp_tool(tool_name: str, parameters: dict) -> str:
-    try:
-        adapter = await get_mcp_adapter()
-        result = await adapter.execute_tool(tool_name, parameters)
-        return str(result)
-    except Exception as e:
-        logger.error(f"Error executing tool {tool_name}: {str(e)}")
-        return f"Error executing tool {tool_name}: {str(e)}"
-
-class CustomOpenAILLM(BaseLLM):
-    @property
-    def _llm_type(self) -> str:
-        return "custom-openai-compatible"
-
-    def _generate(
-        self,
-        prompts: List[str],
-        stop: Optional[List[str]] = None,
-        run_manager=None,
-        **kwargs
-    ) -> LLMResult:
-        global llm_invocation_count
-        
-        # Prevent infinite LLM loops
-        llm_invocation_count += 1
-        if llm_invocation_count > MAX_LLM_INVOCATIONS:
-            raise Exception(f"Maximum LLM invocations ({MAX_LLM_INVOCATIONS}) exceeded")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "applicationType": "BRProduct",
-            "Authorization": f"Bearer {get_api_token()}"
-        }
-        
-        generations = []
-        for prompt in prompts:
-            data = {
-                "messages": [{"role": "user", "content": prompt}],
-                "model": "o1",
-                "max_tokens": 5000,
-            }
-            
-            try:
-                response = requests.post(
-                    OPENAI_API_URL,
-                    json=data,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT
-                )
-                
-                if response.status_code == 200:
-                    response_data = response.json()
-                    answer = response_data["choices"][0]["message"]["content"]
-                    generations.append([Generation(text=answer)])
+elif tool.lower() == "fix_message_parser_tool":
+                table_html, is_html = format_fix_message_table(parsed)
+                if is_html:
+                    st.markdown(table_html, unsafe_allow_html=True)
                 else:
-                    error_msg = f"HTTP {response.status_code}: {response.text}"
-                    logger.error(f"API Error: {error_msg}")
-                    raise Exception(f"Error in Processing: {error_msg}")
-                    
-            except requests.exceptions.Timeout:
-                error_msg = f"Request timed out after {REQUEST_TIMEOUT} seconds"
-                logger.error(error_msg)
-                raise Exception(error_msg)
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request Exception: {e}")
-                raise Exception(f"Network Error: {str(e)}")
-                
-        return LLMResult(generations=generations)
+                    # Fallback for when table formatting fails
+                    return f"<pre>{str(parsed)}</pre>", True
 
-async def setup_agent() -> Tuple[Optional[AgentExecutor], str, str]:
-    mcp_tools_list = await get_mcp_tools()
-    
-    if not mcp_tools_list:
-        logger.warning("No MCP tools available!")
-        return None, "", ""
+def format_fix_message_table(data):
+    """Format FIX message parser tool output as a table with Tag, Value, Description columns."""
+    # If data is a dict with a single key (e.g., 'Message 1'), extract the list
+    if isinstance(data, dict):
+        # If the dict has only one key and its value is a list, use that
+        if len(data) == 1 and isinstance(list(data.values())[0], list):
+            data = list(data.values())[0]
+        else:
+            # Try to find the list in a common key
+            for key in ["parsed_tags", "tags", "fix_tags", "data"]:
+                if key in data and isinstance(data[key], list):
+                    data = data[key]
+                    break
+    if not isinstance(data, list):
+        return None, False
+    # Build table header
+    table_html = """
+    <div class='json-container'>
+        <h3>📑 FIX Message Parsed Output</h3>
+        <table style='width:100%; border-collapse: collapse;'>
+            <thead>
+                <tr style='background:#f0f0f0;'>
+                    <th style='border:1px solid #ccc; padding:8px;'>Tag</th>
+                    <th style='border:1px solid #ccc; padding:8px;'>Value</th>
+                    <th style='border:1px solid #ccc; padding:8px;'>Description</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+    for row in data:
+        tag = row.get("Tag") or row.get("tag") or ""
+        value = row.get("Value") or row.get("value") or ""
+        desc = row.get("Description") or row.get("description") or ""
+        table_html += f"<tr>"
+        table_html += f"<td style='border:1px solid #ccc; padding:8px;'>{tag}</td>"
+        table_html += f"<td style='border:1px solid #ccc; padding:8px;'>{value}</td>"
+        table_html += f"<td style='border:1px solid #ccc; padding:8px;'>{desc}</td>"
+        table_html += "</tr>"
+    table_html += """
+            </tbody>
+        </table>
+    </div>
+    """
+    return table_html, True 
 
-    def make_tool_func(tool_name: str):
-        async def async_tool_func(params_input: str) -> str:
-            try:
-                params = json.loads(params_input) if isinstance(params_input, str) else params_input
-                return await execute_mcp_tool(tool_name, params)
-            except Exception as e:
-                return f"Error executing tool {tool_name}: {str(e)}"
-        
-        return async_tool_func
-
-    tools = []
-    for tool in mcp_tools_list:
-        try:
-            tools.append(Tool(
-                name=tool["name"],
-                func=make_tool_func(tool["name"]),
-                description=tool["description"],
-                coroutine=make_tool_func(tool["name"])
-            ))
-        except Exception as e:
-            logger.error(f"Error creating tool {tool['name']}: {e}")
-
-    if not tools:
-        logger.error("No valid tools created!")
-        return None, "", ""
-
-    tool_names = ", ".join([tool.name for tool in tools])
-    tools_str = "\n".join([f"{tool.name}: {tool.description}" for tool in tools])
-
-    llm = CustomOpenAILLM()
-    
-    prompt = PromptTemplate(
-        template=(
-            "You must use tools to answer questions. Available tools:\n{tools}\n\n"
-            "Rules:\n"
-            "1. Always use tools first\n"
-            "2. Return exact tool output\n"
-            "3. Input must be valid JSON\n"
-            "4. If error occurs, return it exactly\n"
-            "5. If no tool fits, say 'No suitable tool'\n\n"
-            "Format:\n"
-            "Question: input\n"
-            "Thought: analysis\n"
-            "Action: tool_name\n"
-            "Action Input: {{'param':'value'}}\n"
-            "Observation: result\n"
-            "Final Answer: exact output\n\n"
-            "Begin!\n\n"
-            "Question: {input}\n"
-            "Thought:{agent_scratchpad}"
-        ),
-        input_variables=["tools", "input", "agent_scratchpad"]
-    )
-    
-    agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
-    agent_executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        handle_parsing_errors=True,
-        return_intermediate_steps=True,
-        max_iterations=3,  # Limit agent iterations
-        early_stopping_method="generate"
-    )
-    
-    return agent_executor, tool_names, tools_str
-
-@app.post("/process_query")
-async def process_query(query: Query, request: Request):
-    reset_llm_counter()  # Reset counter for new query
-    
-    try:
-        agent_executor, tool_names, tools_str = await setup_agent()
-        
-        if not agent_executor:
-            return {"error": "No tools available"}
-        
-        result = await agent_executor.ainvoke({
-            "input": query.query,
-            "tools": tools_str,
-            "agent_scratchpad": ""
-        })
-        
-        # Extract the most specific tool output
-        if isinstance(result, dict):
-            if "intermediate_steps" in result:
-                for step in reversed(result["intermediate_steps"]):
-                    if isinstance(step, tuple) and len(step) >= 2:
-                        tool_output = step[1]
-                        if tool_output and not tool_output.startswith("Error"):
-                            return {"result": tool_output}
-            
-            return {"result": result.get("output", str(result))}
-        
-        return {"result": str(result)}
-        
-    except asyncio.TimeoutError:
-        return {"error": f"Request timed out after {TOOL_EXECUTION_TIMEOUT} seconds"}
-    except Exception as e:
-        logger.error(f"Error processing query: {str(e)}")
-        return {"error": f"Failed to process query: {str(e)}"}
-
-# ... (rest of the endpoints remain the same)
+update format_fix_message_table function in ui.py to display the data as a table format. above code is showing the data as a html code format.
