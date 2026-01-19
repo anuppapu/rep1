@@ -1,0 +1,3243 @@
+# ============================================================================
+# LANGGRAPH v1.0 – PRODUCTION‑READY AGENT WITH HUMAN‑IN‑THE‑LOOP
+# ============================================================================
+
+from typing import TypedDict, Optional, Literal, Annotated
+from datetime import datetime
+import json
+import uuid
+"""
+LangGraph v1.0 Agentic Framework with State Management
+Handles requirements generation and test case generation with conditional routing
+
+NEW FEATURES ADDED:
+1. Checkpointing & Persistence (MemorySaver)
+2. Human-in-the-loop approval
+3. Subgraphs for modular workflows
+4. Parallel execution for independent tasks
+5. State snapshots and time-travel
+6. Streaming with custom callbacks
+7. Dynamic node injection
+8. Interrupt/Resume capability
+"""
+
+from typing import TypedDict, Annotated, Literal, Optional, Sequence
+from langgraph.graph import StateGraph, END, START
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnableConfig
+from generate_token import generate_token
+import operator
+import json
+import uuid
+from datetime import datetime
+
+
+# ============================================================================
+# STATE DEFINITION WITH ENHANCED FEATURES
+# ============================================================================
+
+class AgentState(TypedDict):
+    """Define the state structure for the agent"""
+    messages: Annotated[list, add_messages]
+    user_intent: Optional[str]  # "requirements", "testcases", "both_sequential", "both_parallel"
+    requirements_output: Optional[dict]
+    testcases_output: Optional[dict]
+    error: Optional[str]
+    iteration_count: int
+    max_iterations: int
+    # New fields for enhanced features
+    session_id: str
+    timestamp: str
+    human_feedback: Optional[str]
+    parallel_tasks: list[str]  # Track tasks that can run in parallel
+    approved: Optional[bool]  # Human approval for requirements
+    metadata: dict
+    # New fields for document handling
+    uploaded_files: list[dict]  # List of uploaded documents with metadata
+    requirements_document: Optional[str]  # Primary document for requirements
+    testcases_document: Optional[str]  # Primary document for test cases
+    support_documents: list[dict]  # Support documents (user guides, setup guides, etc.)
+    execution_mode: Optional[str]  # "sequential", "parallel", "independent"
+# ============================================================================
+#  REQUIREMENT CREATION TOOL
+# ============================================================================
+
+def requirements_creation_tool(document: str, payload_options: dict) -> dict:
+    """
+    Requirements creation tool that calls the actual API endpoint.
+    
+    Args:
+        document: Source document file path (e.g., "ts.pdf") for requirements generation
+        payload_options: Additional options for the API call (currently unused)
+    
+    Returns:
+        dict: Generated requirements from the API
+    """
+    import requests
+    import mimetypes
+    import time
+    import os
+    
+    # API configuration
+    AXIOS_URL = "https://onboardgpt.broadridge.net:8884"
+    API_ENDPOINT = f"{AXIOS_URL}/generate-current-flow"
+    
+    # Hardcoded user details
+    user_name = "Anup Das"
+    user_email = "anup.das@example.com"
+    
+    # Build multipart form-data with proper content type
+    files = []
+    file_handles = []  # Keep track of file handles to close later
+    
+    # Add main document as a file upload
+    if document:
+        # Check if document is a file path
+        if isinstance(document, str) and os.path.exists(document):
+            # It's a file path - open and upload the actual file
+            mime_type, _ = mimetypes.guess_type(document)
+            if mime_type is None:
+                mime_type = "application/octet-stream"
+            file_handle = open(document, 'rb')
+            file_handles.append(file_handle)
+            files.append(('files', (os.path.basename(document), file_handle, mime_type)))
+            print(f"📄 Uploading file: {document} (MIME: {mime_type})")
+        else:
+            # It's text content - convert to file-like object
+            from io import BytesIO
+            doc_bytes = str(document).encode('utf-8')
+            doc_file = BytesIO(doc_bytes)
+            file_handles.append(doc_file)
+            files.append(('files', ('document.txt', doc_file, 'text/plain')))
+            print(f"📄 Uploading text content as document.txt")
+    
+    # Prepare form data (only user details, no document content here)
+    data = {
+        "userName": user_name,
+        "userEmail": user_email
+    }
+    
+    try:
+        # Record start time
+        start_time = time.time()
+        print(f"🚀 Sending requirements generation request to: {API_ENDPOINT}")
+        
+        response = requests.post(API_ENDPOINT, files=files, data=data, verify=False)
+        
+        # Record end time
+        end_time = time.time()
+        
+        response.raise_for_status()  # Raise error for bad status codes
+
+        # Calculate and display total time taken
+        total_time = end_time - start_time
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"⏱️ Requirements generation time: {minutes}:{seconds:06.3f}")
+        
+        # Parse response
+        response_data = response.json()
+        print("✅ Requirements generation completed successfully")
+        
+        # Close file handles
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        
+        # Return structured response
+        return {
+            "status": "success",
+            "requirements": response_data,
+            "metadata": {
+                "api_endpoint": API_ENDPOINT,
+                "files_uploaded": len(files),
+                "processing_time": f"{minutes}:{seconds:06.3f}",
+                "user_name": user_name,
+                "user_email": user_email
+            },
+            "raw_response": response_data
+        }
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error in requirements generation: {e}")
+        
+        # Close file handles in case of error
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+                
+        return {
+            "status": "error",
+            "error": str(e),
+            "metadata": {
+                "api_endpoint": API_ENDPOINT,
+                "files_attempted": len(files),
+                "user_name": user_name,
+                "user_email": user_email
+            }
+        }
+    except Exception as e:
+        print(f"❌ Unexpected error in requirements generation: {e}")
+        
+        # Close file handles in case of error
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+                
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "metadata": {
+                "files_attempted": len(files),
+                "user_name": user_name,
+                "user_email": user_email
+            }
+        }
+
+
+def test_case_generation_tool(requirements: dict, options: dict = None) -> dict:
+    """
+    Test case generation tool that calls the actual API endpoint.
+    
+    Supports two execution modes:
+    1. SEQUENTIAL: Requirements output (text) is passed via businessText field
+    2. PARALLEL/INDEPENDENT: User-uploaded files are passed as file objects
+    
+    Args:
+        requirements: Requirements from the requirements creation tool or document data
+            - For sequential: Contains "requirements" key with generated requirements
+            - For parallel/independent: Contains "document" key with file path or content
+        options: Additional generation options, including:
+            - execution_mode: "sequential", "parallel", or "independent"
+            - support_documents: List of support documents for context
+            - test_strategy: Testing strategy to apply
+            - product: Product name
+            - sub_products: List of sub-products
+    
+    Returns:
+        dict: Generated test cases from the API
+    """
+    import requests
+    import mimetypes
+    import time
+    import os
+    import re
+    from io import BytesIO
+    
+    options = options or {}
+    
+    # API configuration
+    API_URL = "https://testgenaiqa.broadridge.net:5000/generate-test-cases"
+    
+    # Hardcoded user details
+    name_test_gen = "System Agent"
+    email_test_gen = "agent@broadridge.com"
+    session_id = f"agent_session_{int(time.time())}"
+    
+    # Extract options
+    support_docs = options.get("support_documents", [])
+    product = options.get("product", "")
+    sub_products = options.get("sub_products", [])
+    execution_mode = options.get("execution_mode", "sequential")  # Default to sequential
+    
+    # Track file handles for cleanup
+    file_handles = []
+    
+    def sanitize_text(text: str) -> str:
+        """
+        Remove or escape control characters that cause JSON parsing issues.
+        Keeps newlines and tabs but removes other control characters.
+        """
+        if not text:
+            return ""
+        # Remove control characters except newline (\n), carriage return (\r), and tab (\t)
+        # Control characters are in ranges 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
+        sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        # Replace any remaining problematic characters
+        sanitized = sanitized.replace('\r\n', '\n').replace('\r', '\n')
+        return sanitized
+    
+    # Determine execution mode based on requirements structure
+    is_sequential = False
+    if isinstance(requirements, dict):
+        # If requirements contains output from requirements_creation_tool, it's sequential
+        if "requirements" in requirements and requirements.get("status") == "success":
+            is_sequential = True
+        # If execution_mode is explicitly set, use that
+        if execution_mode in ["parallel", "independent"]:
+            is_sequential = False
+        elif execution_mode == "sequential":
+            is_sequential = True
+    
+    print(f"📋 Execution Mode: {'SEQUENTIAL (text-based)' if is_sequential else 'PARALLEL/INDEPENDENT (file-based)'}")
+    
+    # Prepare multipart files section
+    files = []
+    
+    # Prepare form data
+    business_text = ""
+    reference_text = ""
+    
+    if is_sequential:
+        # =====================================================================
+        # SEQUENTIAL MODE: Pass requirements output as text in businessText
+        # =====================================================================
+        print("📝 Using text-based approach for sequential execution")
+        
+        # Extract requirements text from the requirements output
+        if isinstance(requirements, dict):
+            if "requirements" in requirements:
+                # Requirements from requirements generation tool
+                req_data = requirements.get("requirements", {})
+                if isinstance(req_data, dict):
+                    # Safely convert to JSON string
+                    try:
+                        business_text = json.dumps(req_data, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        business_text = str(req_data)
+                elif isinstance(req_data, str):
+                    business_text = req_data
+                else:
+                    business_text = str(req_data)
+            elif "raw_response" in requirements:
+                # Use raw response if available
+                raw = requirements.get("raw_response", {})
+                if isinstance(raw, dict):
+                    try:
+                        business_text = json.dumps(raw, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        business_text = str(raw)
+                else:
+                    business_text = str(raw)
+            else:
+                # Try to convert entire dict to JSON
+                try:
+                    business_text = json.dumps(requirements, ensure_ascii=False, indent=2)
+                except (TypeError, ValueError):
+                    business_text = str(requirements)
+        else:
+            business_text = str(requirements)
+        
+        # Sanitize business text
+        business_text = sanitize_text(business_text)
+        
+        # For sequential mode, support docs are also passed as text in referenceText
+        if support_docs:
+            reference_texts = []
+            for doc in support_docs:
+                if isinstance(doc, dict):
+                    doc_name = doc.get("name", "")
+                    doc_content = doc.get("content", "")
+                    purpose = doc.get("purpose", "")
+                    
+                    # Check if content is a file path
+                    if isinstance(doc_content, str) and os.path.exists(doc_content):
+                        # Read file content for text-based mode
+                        try:
+                            with open(doc_content, 'r', encoding='utf-8', errors='ignore') as f:
+                                doc_content = f.read()
+                        except Exception as e:
+                            print(f"⚠️ Could not read support doc file {doc_content}: {e}")
+                            doc_content = ""
+                    
+                    doc_content = sanitize_text(str(doc_content))
+                    if doc_content:
+                        reference_texts.append(f"Document: {doc_name}\nPurpose: {purpose}\nContent: {doc_content}")
+                else:
+                    reference_texts.append(sanitize_text(str(doc)))
+            reference_text = "\n\n---\n\n".join(reference_texts)
+        
+        # Sanitize reference text
+        reference_text = sanitize_text(reference_text)
+        
+    else:
+        # =====================================================================
+        # PARALLEL/INDEPENDENT MODE: Pass files as file objects
+        # =====================================================================
+        print("📁 Using file-based approach for parallel/independent execution")
+        
+        # Handle main business document as file
+        if isinstance(requirements, dict):
+            doc_content = requirements.get("document", requirements.get("content", ""))
+            doc_name = requirements.get("name", "business_document")
+            
+            if doc_content:
+                # Check if it's a file path
+                if isinstance(doc_content, str) and os.path.exists(doc_content):
+                    # It's a file path - open and upload the actual file
+                    mime_type, _ = mimetypes.guess_type(doc_content)
+                    if mime_type is None:
+                        mime_type = "application/octet-stream"
+                    file_handle = open(doc_content, 'rb')
+                    file_handles.append(file_handle)
+                    files.append(('businessDoc', (os.path.basename(doc_content), file_handle, mime_type)))
+                    print(f"📄 Uploading business document file: {doc_content} (MIME: {mime_type})")
+                else:
+                    # It's text content - convert to file-like object
+                    doc_bytes = str(doc_content).encode('utf-8')
+                    doc_file = BytesIO(doc_bytes)
+                    file_handles.append(doc_file)
+                    
+                    # Determine file extension
+                    if doc_name.endswith(('.pdf', '.doc', '.docx', '.txt')):
+                        filename = doc_name
+                    else:
+                        filename = f"{doc_name}.txt"
+                    
+                    files.append(('businessDoc', (filename, doc_file, 'text/plain')))
+                    print(f"📄 Uploading text content as: {filename}")
+        
+        # Handle support documents as files
+        if support_docs:
+            for idx, doc in enumerate(support_docs):
+                if isinstance(doc, dict):
+                    doc_name = doc.get("name", f"support_doc_{idx}")
+                    doc_content = doc.get("content", "")
+                    
+                    if doc_content:
+                        # Check if it's a file path
+                        if isinstance(doc_content, str) and os.path.exists(doc_content):
+                            # It's a file path - open and upload the actual file
+                            mime_type, _ = mimetypes.guess_type(doc_content)
+                            if mime_type is None:
+                                mime_type = "application/octet-stream"
+                            file_handle = open(doc_content, 'rb')
+                            file_handles.append(file_handle)
+                            files.append(('referenceDoc', (os.path.basename(doc_content), file_handle, mime_type)))
+                            print(f"📄 Uploading support document file: {doc_content} (MIME: {mime_type})")
+                        else:
+                            # It's text content - convert to file-like object
+                            doc_bytes = str(doc_content).encode('utf-8')
+                            doc_file = BytesIO(doc_bytes)
+                            file_handles.append(doc_file)
+                            
+                            # Determine file extension
+                            if doc_name.endswith(('.pdf', '.doc', '.docx', '.txt')):
+                                filename = doc_name
+                            else:
+                                filename = f"{doc_name}.txt"
+                            
+                            files.append(('referenceDoc', (filename, doc_file, 'text/plain')))
+                            print(f"📄 Uploading support doc content as: {filename}")
+    
+    # Prepare form data using tuples for repeated fields
+    data_tuples = [
+        ('businessText', business_text),
+        ('referenceText', reference_text),
+        ('product', product),
+        ('nameTestGen', name_test_gen),
+        ('emailTestGen', email_test_gen),
+        ('sessionId', session_id)
+    ]
+    
+    # Add subProduct[] fields
+    for sub in sub_products:
+        data_tuples.append(('subProduct[]', sub))
+    
+    try:
+        # Record start time
+        start_time = time.time()
+        print(f"🚀 Sending test case generation request to: {API_URL}")
+        print(f"   - Files attached: {len(files)}")
+        print(f"   - Business text length: {len(business_text)} chars")
+        print(f"   - Reference text length: {len(reference_text)} chars")
+        
+        response = requests.post(API_URL, files=files if files else None, data=data_tuples, verify=False)
+        
+        # Record end time
+        end_time = time.time()
+        
+        response.raise_for_status()  # Raise error for bad status codes
+        
+        # Calculate and display total time taken
+        total_time = end_time - start_time
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"⏱️ Test case generation time: {minutes}:{seconds:06.3f}")
+        
+        # Parse response - handle potential JSON issues
+        try:
+            # First, try to get the raw text and sanitize it
+            response_text = response.text
+            # Remove any BOM or other problematic characters
+            response_text = response_text.lstrip('\ufeff')
+            # Sanitize the response text
+            response_text = sanitize_text(response_text)
+            response_data = json.loads(response_text)
+        except json.JSONDecodeError as json_err:
+            print(f"⚠️ JSON parsing error: {json_err}")
+            # Try to extract JSON from response
+            response_text = response.text
+            # Look for JSON object in the response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                try:
+                    response_data = json.loads(sanitize_text(json_match.group()))
+                except json.JSONDecodeError:
+                    # Return raw response as string
+                    response_data = {"raw_response": response_text, "parse_error": str(json_err)}
+            else:
+                response_data = {"raw_response": response_text, "parse_error": str(json_err)}
+        
+        print("✅ Test case generation completed successfully")
+        
+        # Close file handles
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        
+        # Return structured response
+        return {
+            "status": "success",
+            "test_cases": response_data,
+            "metadata": {
+                "api_endpoint": API_URL,
+                "execution_mode": "sequential" if is_sequential else "parallel/independent",
+                "files_uploaded": len(files),
+                "support_documents_used": len(support_docs),
+                "processing_time": f"{minutes}:{seconds:06.3f}",
+                "product": product,
+                "sub_products_count": len(sub_products),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            },
+            "raw_response": response_data
+        }
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error in test case generation: {e}")
+        
+        # Close file handles in case of error
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "metadata": {
+                "api_endpoint": API_URL,
+                "execution_mode": "sequential" if is_sequential else "parallel/independent",
+                "files_attempted": len(files),
+                "support_documents_attempted": len(support_docs),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            }
+        }
+    except Exception as e:
+        print(f"❌ Unexpected error in test case generation: {e}")
+        
+        # Close file handles in case of error
+        for _, file_tuple in files:
+            if len(file_tuple) >= 2 and hasattr(file_tuple[1], 'close'):
+                file_tuple[1].close()
+        
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "metadata": {
+                "support_documents_attempted": len(support_docs),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            }
+        }
+
+
+# ============================================================================
+# TOOL DEFINITIONS FOR LANGCHAIN
+# ============================================================================
+
+from langchain_core.tools import tool
+
+@tool
+def create_requirements(document: str, payload_options: str = "{}") -> str:
+    """
+    Creates requirements from a source document.
+    
+    Args:
+        document: The source document content
+        payload_options: JSON string of payload options for the API call, can include:
+            - support_documents: List of support document contents
+            - context: Additional context information
+    
+    Returns:
+        JSON string of generated requirements
+    """
+    try:
+        options = json.loads(payload_options) if payload_options else {}
+        result = requirements_creation_tool(document, options)
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@tool
+def generate_test_cases(requirements: str, options: str = "{}") -> str:
+    """
+    Generates test cases from requirements.
+    
+    Args:
+        requirements: JSON string of requirements (from requirements creation tool)
+        options: JSON string of additional generation options, can include:
+            - support_documents: List of support document contents
+            - test_strategy: Testing approach (e.g., "boundary", "negative", "integration")
+    
+    Returns:
+        JSON string of generated test cases
+    """
+    try:
+        req_dict = json.loads(requirements) if isinstance(requirements, str) else requirements
+        opts = json.loads(options) if options else {}
+        result = test_case_generation_tool(req_dict, opts)
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+# Tool list
+tools = [create_requirements, generate_test_cases]
+
+
+# ============================================================================
+# NODE FUNCTIONS WITH ENHANCED FEATURES
+# ============================================================================
+
+def intent_analyzer(state: AgentState) -> AgentState:
+    """
+    Analyzes user intent using LLM to determine what tools to call
+    Handles multiple document scenarios, determines execution mode, and identifies support documents
+    """
+    api_key = generate_token()
+    llm = ChatOpenAI(
+        # Model specification - using advanced GPT-5.2 model
+        model="gpt-5.2",
+        
+        # Custom API endpoint for enterprise deployment
+        # Points to Broadridge's internal GPT service endpoint
+        openai_api_base="https://bgt-app-bgpt.enbgai.prd.prd.bfsaws.net/v1/",
+        
+        # Authentication token for API access
+        api_key=api_key,
+        
+        # Custom headers for enterprise application identification
+        # Required for internal routing and security compliance
+        default_headers={"applicationType": "BRProduct"},
+        
+        # Model behavior parameters for optimal performance
+        temperature=0,      # Low temperature for consistent, focused responses
+        timeout=60,         # Extended timeout for complex processing (60 seconds)
+        max_tokens=1000,    # Maximum response length (1000 tokens ≈ 750 words)
+    )
+    
+    messages = state["messages"]
+    last_message = messages[-1].content
+    uploaded_files = state.get("uploaded_files", [])
+    
+    # Create a system prompt for intent classification
+    system_prompt = """You are an intent classification assistant for a requirements and test case generation system.
+
+Analyze the user's query and uploaded documents to determine:
+1. What they want to generate (requirements, test cases, or both)
+2. How documents should be used (primary vs support documents)
+3. Whether tasks can run in parallel
+
+IMPORTANT: Documents can be categorized as:
+- PRIMARY: Main documents for generating requirements or test cases
+- SUPPORT: User guides, setup guides, reference documents that provide context
+
+Respond with ONLY a JSON object in this exact format:
+{
+    "intent": "requirements|testcases|both_sequential|both_parallel|clarify",
+    "execution_mode": "sequential|parallel|independent",
+    "reasoning": "brief explanation",
+    "document_classification": [
+        {
+            "document_index": 0,
+            "document_name": "filename",
+            "type": "primary_requirements|primary_testcases|support",
+            "purpose": "brief description"
+        }
+    ],
+    "support_documents_present": true|false,
+    "scenario": "single_doc_both|two_docs_parallel|single_req|single_tc|with_support"
+}
+
+Document Types:
+- primary_requirements: Main document for requirements generation
+- primary_testcases: Main document for test cases generation (independent source)
+- support: User guide, setup guide, reference doc, API documentation, etc.
+
+Intent Options:
+- "requirements": Only generate requirements
+- "testcases": Only generate test cases
+- "both_sequential": Generate requirements first, then use output for test cases
+- "both_parallel": Generate both independently (different source documents)
+- "clarify": Need more information
+
+Examples:
+1. "Generate requirements from feature_spec.pdf. Use user_guide.pdf as reference."
+   → primary: feature_spec.pdf, support: user_guide.pdf
+   
+2. "Create requirements from doc1.txt and test cases from doc2.txt. Also attached setup_guide.pdf."
+   → primary_req: doc1.txt, primary_tc: doc2.txt, support: setup_guide.pdf
+
+3. "Generate both from main_spec.pdf. Reference: api_docs.pdf and user_manual.pdf"
+   → primary: main_spec.pdf, support: api_docs.pdf, user_manual.pdf
+
+Keywords for support documents:
+- "reference", "guide", "documentation", "manual", "help", "context", "background"
+- "user guide", "setup guide", "API docs", "reference material"
+"""
+    
+    # Prepare document information
+    doc_info = ""
+    if uploaded_files:
+        doc_info = f"\n\nUploaded Documents ({len(uploaded_files)}):\n"
+        for i, doc in enumerate(uploaded_files):
+            doc_info += f"- Document {i}: {doc.get('name', 'unknown')} ({doc.get('type', 'unknown')})\n"
+            if doc.get('description'):
+                doc_info += f"  Description: {doc.get('description')}\n"
+    
+    # Call LLM for intent classification
+    classification_messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"User query: {last_message}{doc_info}")
+    ]
+    
+    try:
+        response = llm.invoke(classification_messages)
+        
+        # Parse LLM response
+        response_content = response.content.strip()
+        
+        # Remove markdown code blocks if present
+        if "```json" in response_content:
+            response_content = response_content.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_content:
+            response_content = response_content.split("```")[1].split("```")[0].strip()
+        
+        intent_data = json.loads(response_content)
+        
+        intent = intent_data.get("intent", "clarify")
+        execution_mode = intent_data.get("execution_mode", "sequential")
+        reasoning = intent_data.get("reasoning", "")
+        document_classification = intent_data.get("document_classification", [])
+        support_documents_present = intent_data.get("support_documents_present", False)
+        scenario = intent_data.get("scenario", "unknown")
+        
+        print(f"\n{'='*60}")
+        print(f"INTENT ANALYSIS RESULTS")
+        print(f"{'='*60}")
+        print(f"Intent: {intent}")
+        print(f"Execution Mode: {execution_mode}")
+        print(f"Scenario: {scenario}")
+        print(f"Support Documents Present: {support_documents_present}")
+        print(f"Reasoning: {reasoning}")
+        print(f"\nDocument Classification:")
+        for doc_class in document_classification:
+            print(f"  - {doc_class.get('document_name')}: {doc_class.get('type')} ({doc_class.get('purpose')})")
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"Error in LLM intent classification: {e}")
+        # Fallback logic
+        last_message_lower = last_message.lower()
+        uploaded_count = len(uploaded_files)
+        
+        # Simple heuristic for support documents
+        support_keywords = ["guide", "reference", "manual", "documentation", "help", "api doc", "context"]
+        support_documents_present = any(keyword in last_message_lower for keyword in support_keywords)
+        
+        if uploaded_count >= 2 and "both" in last_message_lower:
+            intent = "both_parallel"
+            execution_mode = "parallel"
+            scenario = "two_docs_parallel"
+        elif uploaded_count >= 1 and ("both" in last_message_lower or 
+              ("requirement" in last_message_lower and "test" in last_message_lower)):
+            intent = "both_sequential"
+            execution_mode = "sequential"
+            scenario = "single_doc_both"
+        elif "requirement" in last_message_lower or "req" in last_message_lower:
+            intent = "requirements"
+            execution_mode = "independent"
+            scenario = "single_req"
+        elif "test" in last_message_lower or "tc" in last_message_lower:
+            intent = "testcases"
+            execution_mode = "independent"
+            scenario = "single_tc"
+        else:
+            intent = "clarify"
+            execution_mode = "sequential"
+            scenario = "unknown"
+        
+        reasoning = "Fallback classification due to LLM error"
+        document_classification = []
+    
+    # Extract documents based on classification
+    requirements_doc = None
+    testcases_doc = None
+    support_docs = []
+    
+    if uploaded_files and document_classification:
+        for doc_class in document_classification:
+            doc_idx = doc_class.get("document_index")
+            doc_type = doc_class.get("type")
+            
+            if doc_idx < len(uploaded_files):
+                doc = uploaded_files[doc_idx]
+                
+                if doc_type == "primary_requirements":
+                    requirements_doc = doc.get("content", "")
+                elif doc_type == "primary_testcases":
+                    testcases_doc = doc.get("content", "")
+                elif doc_type == "support":
+                    support_docs.append({
+                        "name": doc.get("name", f"support_doc_{doc_idx}"),
+                        "content": doc.get("content", ""),
+                        "purpose": doc_class.get("purpose", "Support document")
+                    })
+    
+    # Fallback document assignment if classification failed
+    if not requirements_doc and not testcases_doc and uploaded_files:
+        if execution_mode == "parallel" and len(uploaded_files) >= 2:
+            requirements_doc = uploaded_files[0].get("content", "")
+            testcases_doc = uploaded_files[1].get("content", "")
+        elif execution_mode == "sequential" and len(uploaded_files) >= 1:
+            requirements_doc = uploaded_files[0].get("content", "")
+    
+    # Determine parallel tasks based on execution mode
+    parallel_tasks = []
+    if execution_mode == "parallel" and intent == "both_parallel":
+        parallel_tasks = ["requirements", "testcases"]
+    
+    # Store in metadata
+    metadata = state.get("metadata", {})
+    metadata["intent_reasoning"] = reasoning
+    metadata["document_classification"] = document_classification
+    metadata["scenario"] = scenario
+    metadata["support_documents_count"] = len(support_docs)
+    
+    return {
+        **state,
+        "user_intent": intent,
+        "execution_mode": execution_mode,
+        "iteration_count": 0,
+        "max_iterations": 5,
+        "parallel_tasks": parallel_tasks,
+        "timestamp": datetime.now().isoformat(),
+        "requirements_document": requirements_doc,
+        "testcases_document": testcases_doc,
+        "support_documents": support_docs,
+        "metadata": metadata
+    }
+
+
+def human_review_node(state: AgentState) -> AgentState:
+    """
+    FEATURE: Human-in-the-loop node for requirements approval
+    Uses interrupt to halt execution and wait for human review
+    """
+    from langgraph.types import interrupt
+    
+    requirements = state.get("requirements_output")
+    
+    if not requirements:
+        return {
+            **state,
+            "error": "No requirements to review"
+        }
+    
+    # Format requirements for display
+    try:
+        if isinstance(requirements, dict):
+            req_display = json.dumps(requirements, indent=2)
+        else:
+            req_display = str(requirements)
+    except:
+        req_display = str(requirements)
+    
+    # Truncate if too long
+    if len(req_display) > 3000:
+        req_display = req_display[:3000] + "\n... (truncated)"
+    
+    # Interrupt and wait for human input
+    interrupt({
+        "message": "Human review required for generated requirements",
+        "requirements": req_display,
+        "prompt": "Type 'approve' or 'y' to continue to test case generation, 'reject' or 'n' to end the process"
+    })
+    
+    return state  # Execution halts here until resumed
+
+
+def review_router(state: AgentState) -> str:
+    """
+    Routes based on human approval decision
+    """
+    approved = state.get("approved")
+    
+    if approved is True:
+        return "continue"
+    return "end"
+
+
+def parallel_requirements_node(state: AgentState) -> AgentState:
+    """
+    FEATURE: Parallel execution node for requirements
+    Runs independently when parallel execution is enabled
+    Includes support documents for enhanced context
+    """
+    print("\n[PARALLEL] Executing requirements generation...")
+    
+    requirements_doc = state.get("requirements_document")
+    support_docs = state.get("support_documents", [])
+    
+    if not requirements_doc:
+        return {
+            **state,
+            "error": "No document available for requirements generation"
+        }
+    
+    try:
+        # Prepare payload options with support documents
+        payload_options = {}
+        if support_docs:
+            payload_options["support_documents"] = [
+                {
+                    "name": doc.get("name"),
+                    "content": doc.get("content"),
+                    "purpose": doc.get("purpose", "reference")
+                }
+                for doc in support_docs
+            ]
+        
+        print(f"[PARALLEL] Using {len(support_docs)} support documents")
+        
+        # Call the requirements tool directly
+        result = requirements_creation_tool(requirements_doc, payload_options)
+        
+        tool_message = ToolMessage(
+            content=json.dumps(result),
+            tool_call_id="parallel_req",
+            name="create_requirements"
+        )
+        
+        return {
+            **state,
+            "requirements_output": result,
+            "messages": [tool_message]
+        }
+    except Exception as e:
+        return {
+            **state,
+            "error": f"Parallel requirements generation failed: {str(e)}"
+        }
+
+
+def parallel_testcases_node(state: AgentState) -> AgentState:
+    """
+    FEATURE: Parallel execution node for test cases
+    Runs independently when parallel execution is enabled with separate document
+    Includes support documents for enhanced context
+    """
+    print("\n[PARALLEL] Executing test case generation...")
+    
+    testcases_doc = state.get("testcases_document")
+    support_docs = state.get("support_documents", [])
+    
+    if not testcases_doc:
+        # Check if we should use requirements output instead
+        requirements_output = state.get("requirements_output")
+        if requirements_output:
+            source_data = requirements_output
+        else:
+            return {
+                **state,
+                "error": "No document or requirements available for test case generation"
+            }
+    else:
+        # Use the test cases document as source
+        source_data = {"document": testcases_doc}
+    
+    try:
+        # Prepare options with support documents
+        options = {}
+        if support_docs:
+            options["support_documents"] = [
+                {
+                    "name": doc.get("name"),
+                    "content": doc.get("content"),
+                    "purpose": doc.get("purpose", "reference")
+                }
+                for doc in support_docs
+            ]
+        
+        print(f"[PARALLEL] Using {len(support_docs)} support documents")
+        
+        # Call the test cases tool directly
+        result = test_case_generation_tool(source_data, options)
+        
+        tool_message = ToolMessage(
+            content=json.dumps(result),
+            tool_call_id="parallel_tc",
+            name="generate_test_cases"
+        )
+        
+        return {
+            **state,
+            "testcases_output": result,
+            "messages": [tool_message]
+        }
+    except Exception as e:
+        return {
+            **state,
+            "error": f"Parallel test case generation failed: {str(e)}"
+        }
+
+
+def agent_planner(state: AgentState) -> AgentState:
+    """
+    Plans and executes tool calls based on intent and execution mode
+    Handles sequential and parallel execution scenarios with support documents
+    """
+    api_key = generate_token()
+    llm = ChatOpenAI(
+        # Model specification - using advanced GPT-5.2 model
+        model="gpt-5.2",
+        
+        # Custom API endpoint for enterprise deployment
+        # Points to Broadridge's internal GPT service endpoint
+        openai_api_base="https://bgt-app-bgpt.enbgai.prd.prd.bfsaws.net/v1/",
+        
+        # Authentication token for API access
+        api_key=api_key,
+        
+        # Custom headers for enterprise application identification
+        # Required for internal routing and security compliance
+        default_headers={"applicationType": "BRProduct"},
+        
+        # Model behavior parameters for optimal performance
+        temperature=0,      # Low temperature for consistent, focused responses
+        timeout=60,         # Extended timeout for complex processing (60 seconds)
+        max_tokens=1000,    # Maximum response length (1000 tokens ≈ 750 words)
+    )
+    llm_with_tools = llm.bind_tools(tools)
+    
+    messages = state["messages"]
+    intent = state["user_intent"]
+    execution_mode = state.get("execution_mode", "sequential")
+    requirements_doc = state.get("requirements_document")
+    testcases_doc = state.get("testcases_document")
+    support_docs = state.get("support_documents", [])
+    requirements_output = state.get("requirements_output")
+    testcases_output = state.get("testcases_output")
+    
+    # Prepare support documents context
+    support_context = ""
+    if support_docs:
+        support_context = f"\n\nSupport Documents ({len(support_docs)}):\n"
+        for i, doc in enumerate(support_docs, 1):
+            support_context += f"- {doc.get('name')}: {doc.get('purpose', 'Reference document')}\n"
+            support_context += f"  Content preview: {doc.get('content', '')[:150]}...\n"
+    
+    # Determine what needs to be done
+    needs_requirements = intent in ["requirements", "both_sequential", "both_parallel"]
+    needs_testcases = intent in ["testcases", "both_sequential", "both_parallel"]
+    
+    # Check what's already done
+    has_requirements = bool(requirements_output)
+    has_testcases = bool(testcases_output)
+    
+    # Create appropriate system message based on scenario
+    if execution_mode == "parallel" and intent == "both_parallel":
+        # Parallel execution: both tools can be called simultaneously
+        system_msg = SystemMessage(content=f"""You are an assistant that can generate requirements and test cases in parallel.
+
+The user wants BOTH requirements and test cases generated from DIFFERENT source documents.
+
+Available documents:
+- Requirements document: {"Available" if requirements_doc else "Not available"}
+- Test cases document: {"Available" if testcases_doc else "Not available"}
+{support_context}
+
+IMPORTANT: Include support documents in payload_options/options for BOTH tool calls.
+
+Call BOTH tools in a single response:
+1. create_requirements with the requirements document + support documents
+2. generate_test_cases with the test cases document + support documents
+
+These can execute in parallel because they use different source documents.
+
+Format for payload_options/options:
+{{
+    "support_documents": [
+        {{"name": "doc_name", "content": "doc_content", "purpose": "reference"}},
+        ...
+    ]
+}}""")
+
+    elif execution_mode == "sequential" and intent == "both_sequential":
+        # Sequential execution: requirements first, then test cases using that output
+        if not has_requirements:
+            system_msg = SystemMessage(content=f"""You are generating requirements first in a sequential workflow.
+
+The user wants both requirements and test cases from a SINGLE document.
+
+Step 1 (current): Generate requirements from the document
+Step 2 (next): Use the requirements output to generate test cases
+
+Document available: {"Yes" if requirements_doc else "No"}
+{support_context}
+
+IMPORTANT: Include support documents in payload_options for enhanced context.
+
+Call the create_requirements tool now with:
+- document: the main requirements document
+- payload_options: JSON string containing support_documents array
+
+Format for payload_options:
+{{
+    "support_documents": [
+        {{"name": "doc_name", "content": "doc_content"}},
+        ...
+    ]
+}}""")
+        
+        elif has_requirements and not has_testcases:
+            system_msg = SystemMessage(content=f"""You are generating test cases in a sequential workflow.
+
+Step 1 (completed): Requirements have been generated
+Step 2 (current): Generate test cases using the requirements output
+
+Requirements are available in the conversation state.
+{support_context}
+
+IMPORTANT: Include support documents in options for enhanced test case generation.
+
+Call the generate_test_cases tool with:
+- requirements: the requirements from the previous step
+- options: JSON string containing support_documents array
+
+Format for options:
+{{
+    "support_documents": [
+        {{"name": "doc_name", "content": "doc_content"}},
+        ...
+    ]
+}}""")
+        
+        else:
+            # Both done
+            system_msg = SystemMessage(content="Both requirements and test cases have been generated. No further action needed.")
+    
+    elif intent == "requirements":
+        # Only requirements needed
+        if has_requirements:
+            system_msg = SystemMessage(content="Requirements have already been generated.")
+        else:
+            system_msg = SystemMessage(content=f"""You are generating requirements only.
+
+Document available: {"Yes" if requirements_doc else "No"}
+{support_context}
+
+IMPORTANT: Include support documents in payload_options.
+
+Call the create_requirements tool with support documents for context.""")
+    
+    elif intent == "testcases":
+        # Only test cases needed
+        if has_testcases:
+            system_msg = SystemMessage(content="Test cases have already been generated.")
+        else:
+            # Check if we should use existing requirements or a document
+            if requirements_output:
+                system_msg = SystemMessage(content=f"""You are generating test cases using existing requirements.
+
+Requirements are available in the conversation state.
+{support_context}
+
+IMPORTANT: Include support documents in options.
+
+Call the generate_test_cases tool with the requirements + support documents.""")
+            elif testcases_doc:
+                system_msg = SystemMessage(content=f"""You are generating test cases from a document.
+
+Test cases document is available.
+{support_context}
+
+IMPORTANT: Include support documents in options.
+
+Call the generate_test_cases tool with the document content + support documents.""")
+            else:
+                system_msg = SystemMessage(content="Cannot generate test cases: no requirements or document available.")
+    
+    else:
+        # Clarify or unknown
+        system_msg = SystemMessage(content="Ask the user to clarify what they want to generate.")
+    
+    # Add context about available data
+    context_parts = []
+    if requirements_doc:
+        context_parts.append(f"Requirements document: {requirements_doc[:200]}...")
+    if testcases_doc:
+        context_parts.append(f"Test cases document: {testcases_doc[:200]}...")
+    if requirements_output:
+        context_parts.append(f"Requirements output: {json.dumps(requirements_output)[:200]}...")
+    if support_docs:
+        for doc in support_docs:
+            context_parts.append(f"Support doc ({doc.get('name')}): {doc.get('content', '')[:150]}...")
+    
+    if context_parts:
+        context_msg = HumanMessage(content="Available Context:\n" + "\n\n".join(context_parts))
+        messages_with_context = [system_msg, context_msg] + messages
+    else:
+        messages_with_context = [system_msg] + messages
+    
+    # Invoke LLM
+    response = llm_with_tools.invoke(messages_with_context)
+    
+    return {
+        **state,
+        "messages": [response],
+        "iteration_count": state["iteration_count"] + 1
+    }
+
+
+def tool_executor(state: AgentState) -> AgentState:
+    """
+    Executes tools and handles errors
+    """
+    try:
+        tool_node = ToolNode(tools)
+        result = tool_node.invoke(state)
+        
+        # Extract tool outputs and store in state
+        messages = result["messages"]
+        requirements_generated = False
+        for msg in messages:
+            if isinstance(msg, ToolMessage):
+                try:
+                    output = json.loads(msg.content)
+                    if msg.name == "create_requirements":
+                        result["requirements_output"] = output
+                        requirements_generated = True
+                    elif msg.name == "generate_test_cases":
+                        result["testcases_output"] = output
+                except json.JSONDecodeError:
+                    pass
+        
+        return {**state, **result, "error": None}
+    
+    except Exception as e:
+        return {
+            **state,
+            "error": f"Tool execution error: {str(e)}"
+        }
+
+
+def response_generator(state: AgentState) -> AgentState:
+    """
+    Generates final response based on outputs
+    """
+    api_key = generate_token()
+    llm = ChatOpenAI(
+        # Model specification - using advanced GPT-5.2 model
+        model="gpt-5.2",
+        
+        # Custom API endpoint for enterprise deployment
+        # Points to Broadridge's internal GPT service endpoint
+        openai_api_base="https://bgt-app-bgpt.enbgai.prd.prd.bfsaws.net/v1/",
+        
+        # Authentication token for API access
+        api_key=api_key,
+        
+        # Custom headers for enterprise application identification
+        # Required for internal routing and security compliance
+        default_headers={"applicationType": "BRProduct"},
+        
+        # Model behavior parameters for optimal performance
+        temperature=0.3,    # Slightly higher temperature for creative responses
+        timeout=60,         # Extended timeout for complex processing (60 seconds)
+        max_tokens=1000,    # Maximum response length (1000 tokens ≈ 750 words)
+    )
+    
+    messages = state["messages"]
+    requirements = state.get("requirements_output")
+    testcases = state.get("testcases_output")
+    error = state.get("error")
+    
+    # Create context for response generation
+    context = "Based on the tool executions:\n"
+    if error:
+        context += f"Error occurred: {error}\n"
+    if requirements:
+        context += f"Requirements generated: {json.dumps(requirements, indent=2)}\n"
+    if testcases:
+        context += f"Test cases generated: {json.dumps(testcases, indent=2)}\n"
+    
+    system_msg = SystemMessage(content=f"""Generate a helpful response to the user.
+    {context}
+    Provide a clear summary of what was accomplished.""")
+    
+    response = llm.invoke([system_msg] + messages)
+    
+    return {
+        **state,
+        "messages": [response]
+    }
+
+
+def error_handler(state: AgentState) -> AgentState:
+    """
+    Handles errors and provides user-friendly messages
+    """
+    error = state.get("error", "Unknown error occurred")
+    
+    error_message = AIMessage(content=f"""I encountered an error while processing your request:
+
+{error}
+
+Please try again or rephrase your request. You can ask me to:
+- Generate requirements from a document
+- Generate test cases from requirements
+- Generate both requirements and test cases""")
+    
+    return {
+        **state,
+        "messages": [error_message],
+        "error": None
+    }
+
+
+# ============================================================================
+# ROUTING FUNCTIONS WITH ENHANCED LOGIC
+# ============================================================================
+
+def should_continue_planning(state: AgentState) -> Literal["tools", "generate_response", "error", "end", "human_review", "parallel_execution"]:
+    """
+    ENHANCED: Determines next step with parallel execution and human review support
+    """
+    messages = state["messages"]
+    last_message = messages[-1]
+    execution_mode = state.get("execution_mode", "sequential")
+    intent = state.get("user_intent")
+    
+    # Check for errors
+    if state.get("error"):
+        return "error"
+    
+    # Check iteration limit
+    if state["iteration_count"] >= state["max_iterations"]:
+        return "generate_response"
+    
+    # If intent is clarify, end and wait for user input
+    if intent == "clarify":
+        return "end"
+    
+    # NEW: Check if parallel execution should be triggered
+    if execution_mode == "parallel" and intent == "both_parallel":
+        # Check if both tasks haven't been started yet
+        if not state.get("requirements_output") and not state.get("testcases_output"):
+            return "parallel_execution"
+    
+    # If last message has tool calls, execute them
+    if hasattr(last_message, "tool_calls") and len(last_message.tool_calls) > 0:
+        return "tools"
+    
+    # Otherwise, generate final response
+    return "generate_response"
+
+
+def should_continue_after_tools(state: AgentState) -> Literal["agent", "error", "human_review"]:
+    """
+    Determines next step after tool execution.
+    Routes to human_review after requirements generation for approval.
+    """
+    if state.get("error"):
+        return "error"
+    
+    # If requirements were just generated and intent needs both, go to human review
+    intent = state.get("user_intent")
+    has_requirements = bool(state.get("requirements_output"))
+    has_testcases = bool(state.get("testcases_output"))
+    
+    # Route to human review after requirements generation if user wants both
+    if has_requirements and not has_testcases and intent in ["both_sequential", "both_parallel"]:
+        return "human_review"
+    
+    return "agent"
+
+
+# ============================================================================
+# GRAPH CONSTRUCTION WITH ENHANCED FEATURES
+# ============================================================================
+
+def create_agent_graph(use_checkpointing: bool = True):
+    """
+    ENHANCED: Creates and compiles the LangGraph workflow with human-in-the-loop support
+    
+    Args:
+        use_checkpointing: Enable state persistence and time-travel
+    """
+    # Initialize graph
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("intent_analyzer", intent_analyzer)
+    workflow.add_node("agent", agent_planner)
+    workflow.add_node("tools", tool_executor)
+    workflow.add_node("generate_response", response_generator)
+    workflow.add_node("error_handler", error_handler)
+    
+    # NEW: Add human review node for requirements approval
+    workflow.add_node("human_review", human_review_node)
+    
+    # NEW: Add parallel execution nodes
+    workflow.add_node("parallel_req", parallel_requirements_node)
+    workflow.add_node("parallel_tc", parallel_testcases_node)
+    
+    # Add edges
+    workflow.add_edge(START, "intent_analyzer")
+    workflow.add_edge("intent_analyzer", "agent")
+    
+    # Conditional edges from agent
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue_planning,
+        {
+            "tools": "tools",
+            "generate_response": "generate_response",
+            "error": "error_handler",
+            "end": END,
+            "human_review": "human_review",
+            "parallel_execution": "parallel_req"
+        }
+    )
+    
+    # NEW: Parallel execution paths
+    # After parallel_req, go to parallel_tc for test case generation
+    workflow.add_edge("parallel_req", "parallel_tc")
+    # After parallel_tc completes, go to generate_response
+    workflow.add_edge("parallel_tc", "generate_response")
+    
+    # Conditional edges from tools - route to human_review after requirements
+    workflow.add_conditional_edges(
+        "tools",
+        should_continue_after_tools,
+        {
+            "agent": "agent",
+            "error": "error_handler",
+            "human_review": "human_review"
+        }
+    )
+    
+    # Conditional edges from human_review - based on approval
+    workflow.add_conditional_edges(
+        "human_review",
+        review_router,
+        {
+            "continue": "agent",  # Continue to test case generation
+            "end": "generate_response"  # End and generate response
+        }
+    )
+    
+    # Final edges
+    workflow.add_edge("generate_response", END)
+    workflow.add_edge("error_handler", END)
+    
+    # FEATURE: Compile with checkpointing for state persistence
+    if use_checkpointing:
+        memory = MemorySaver()
+        return workflow.compile(checkpointer=memory)
+    else:
+        return workflow.compile()
+
+
+# ============================================================================
+# USAGE FUNCTIONS WITH ENHANCED FEATURES
+# ============================================================================
+
+def run_agent(user_query: str, uploaded_files: list[dict] = None, config: dict = None, session_id: str = None):
+    """
+    ENHANCED: Runs the agent with support for multiple documents including support documents
+    
+    Args:
+        user_query: User's input query
+        uploaded_files: List of uploaded documents with structure:
+            [
+                {
+                    "name": "feature_spec.pdf",
+                    "type": "pdf",
+                    "content": "...",
+                    "description": "Main feature specification"  # Optional
+                },
+                {
+                    "name": "user_guide.pdf",
+                    "type": "pdf",
+                    "content": "...",
+                    "description": "User guide for reference"  # Optional, helps LLM classify
+                }
+            ]
+        config: Optional configuration for the graph execution
+        session_id: Session ID for state persistence
+    
+    Returns:
+        Final state after execution and session_id
+    """
+    graph = create_agent_graph(use_checkpointing=True)
+    
+    # Generate session ID if not provided
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+    
+    # Process uploaded files
+    files = uploaded_files or []
+    
+    initial_state = {
+        "messages": [HumanMessage(content=user_query)],
+        "user_intent": None,
+        "requirements_output": None,
+        "testcases_output": None,
+        "error": None,
+        "iteration_count": 0,
+        "max_iterations": 5,
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+        "human_feedback": None,
+        "parallel_tasks": [],
+        "approved": None,
+        "metadata": {},
+        "uploaded_files": files,
+        "requirements_document": None,
+        "testcases_document": None,
+        "support_documents": [],
+        "execution_mode": None
+    }
+    
+    # FEATURE: Config with thread for checkpointing
+    config = config or {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": 25
+    }
+    
+    # Track last state during streaming
+    last_state = initial_state.copy()
+    
+    # Stream the execution
+    for event in graph.stream(initial_state, config):
+        for node_name, node_state in event.items():
+            # Update last_state with the node_state
+            last_state.update(node_state)
+            
+            print(f"\n{'='*60}")
+            print(f"Node: {node_name}")
+            print(f"Session: {session_id}")
+            
+            # Show execution mode if available
+            if "execution_mode" in node_state and node_state["execution_mode"]:
+                print(f"Execution Mode: {node_state['execution_mode']}")
+            
+            # Show support documents count
+            if "support_documents" in node_state:
+                support_count = len(node_state.get("support_documents", []))
+                if support_count > 0:
+                    print(f"Support Documents: {support_count}")
+            
+            print(f"{'='*60}")
+            
+            if "messages" in node_state and node_state["messages"]:
+                last_msg = node_state["messages"][-1]
+                print(f"Message Type: {type(last_msg).__name__}")
+                if hasattr(last_msg, "content"):
+                    content_preview = str(last_msg.content)[:200]
+                    print(f"Content: {content_preview}...")
+                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    print(f"Tool Calls: {last_msg.tool_calls}")
+            
+            # Show human review status
+            if node_name == "human_review":
+                print("[HUMAN REVIEW] Waiting for approval...")
+            
+            # Show parallel execution status
+            if node_name in ["parallel_req", "parallel_tc"]:
+                print(f"[PARALLEL EXECUTION] Running {node_name}")
+            
+            # Track requirements and test cases output
+            if "requirements_output" in node_state and node_state["requirements_output"]:
+                last_state["requirements_output"] = node_state["requirements_output"]
+            if "testcases_output" in node_state and node_state["testcases_output"]:
+                last_state["testcases_output"] = node_state["testcases_output"]
+    
+    # Get final state from checkpoint (this preserves all accumulated state)
+    final_state_snapshot = graph.get_state(config)
+    final_state = final_state_snapshot.values if final_state_snapshot else last_state
+    
+    # Check if we're at an interrupt point
+    if final_state_snapshot and final_state_snapshot.next:
+        next_nodes = final_state_snapshot.next
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"EXECUTION SUMMARY")
+    print(f"{'='*60}")
+    print(f"Documents Uploaded: {len(files)}")
+    if final_state.get("support_documents"):
+        print(f"Support Documents Used: {len(final_state['support_documents'])}")
+        for doc in final_state['support_documents']:
+            print(f"  - {doc.get('name')}: {doc.get('purpose', 'reference')}")
+    print(f"Execution Mode: {final_state.get('execution_mode')}")
+    print(f"Requirements Generated: {bool(final_state.get('requirements_output'))}")
+    print(f"Test Cases Generated: {bool(final_state.get('testcases_output'))}")
+    print(f"{'='*60}")
+    
+    return final_state, session_id
+
+
+def resume_agent(session_id: str, user_input: str = None):
+    """
+    FEATURE: Resume execution from a checkpoint
+    
+    Args:
+        session_id: Session ID to resume
+        user_input: Optional new user input
+    
+    Returns:
+        Final state after resumption
+    """
+    graph = create_agent_graph(use_checkpointing=True)
+    
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": 25
+    }
+    
+    # Get current state
+    state = graph.get_state(config)
+    
+    if not state:
+        print("❌ No state found for this session.")
+        return None
+    
+    print(f"\nResuming session: {session_id}")
+    print(f"Current node: {state.next}")
+    
+    # If user provides new input, add to messages
+    if user_input:
+        current_state = state.values
+        current_state["messages"].append(HumanMessage(content=user_input))
+        
+        # Update the state
+        graph.update_state(config, current_state)
+        
+        # Continue execution
+        for event in graph.stream(None, config):
+            for node_name, node_state in event.items():
+                print(f"\n{'='*60}")
+                print(f"Node: {node_name}")
+                print(f"{'='*60}")
+                
+                if "messages" in node_state and node_state["messages"]:
+                    last_msg = node_state["messages"][-1]
+                    if hasattr(last_msg, "content"):
+                        print(f"Message: {last_msg.content}")
+    
+    return graph.get_state(config)
+
+
+def get_state_history(session_id: str, limit: int = 10):
+    """
+    FEATURE: Get state history for time-travel debugging
+    
+    Args:
+        session_id: Session ID
+        limit: Number of historical states to retrieve
+    
+    Returns:
+        List of historical states
+    """
+    graph = create_agent_graph(use_checkpointing=True)
+    
+    config = {
+        "configurable": {"thread_id": session_id}
+    }
+    
+    history = []
+    for state in graph.get_state_history(config):
+        history.append({
+            "timestamp": state.values.get("timestamp"),
+            "node": state.next,
+            "iteration": state.values.get("iteration_count"),
+            "approved": state.values.get("approved")
+        })
+        
+        if len(history) >= limit:
+            break
+    
+    return history
+
+
+def create_subgraph_for_validation():
+    """
+    FEATURE: Create a subgraph for validation workflow
+    This can be embedded in the main graph for modular design
+    """
+    class ValidationState(TypedDict):
+        data: dict
+        validation_result: Optional[dict]
+        errors: list[str]
+    
+    def validate_requirements(state: ValidationState) -> ValidationState:
+        data = state["data"]
+        errors = []
+        
+        if not data.get("requirements"):
+            errors.append("No requirements found")
+        
+        return {
+            **state,
+            "validation_result": {"valid": len(errors) == 0},
+            "errors": errors
+        }
+    
+    def validate_testcases(state: ValidationState) -> ValidationState:
+        data = state["data"]
+        errors = []
+        
+        if not data.get("test_cases"):
+            errors.append("No test cases found")
+        
+        return {
+            **state,
+            "validation_result": {"valid": len(errors) == 0},
+            "errors": errors
+        }
+    
+    # Create subgraph
+    subgraph = StateGraph(ValidationState)
+    subgraph.add_node("validate_req", validate_requirements)
+    subgraph.add_node("validate_tc", validate_testcases)
+    
+    subgraph.add_edge(START, "validate_req")
+    subgraph.add_edge("validate_req", "validate_tc")
+    subgraph.add_edge("validate_tc", END)
+    
+    return subgraph.compile()
+
+
+# ============================================================================
+# CLI WRAPPER FOR HUMAN-IN-THE-LOOP
+# ============================================================================
+
+def run_with_cli_hitl(user_query: str, uploaded_files: list[dict] = None, thread_id: str = None):
+    """
+    CLI wrapper for human-in-the-loop workflow.
+    
+    Runs the agent, halts at human_review node for requirements approval,
+    then resumes based on user's decision.
+    
+    Args:
+        user_query: User's input query
+        uploaded_files: List of uploaded documents
+        thread_id: Session/thread ID for state persistence
+    
+    Returns:
+        Final state after workflow completion
+    """
+    print("\n🚀 Starting agent with Human-in-the-Loop...\n")
+    
+    graph = create_agent_graph(use_checkpointing=True)
+    
+    # Generate thread ID if not provided
+    if thread_id is None:
+        thread_id = str(uuid.uuid4())
+    
+    # Process uploaded files
+    files = uploaded_files or []
+    
+    initial_state = {
+        "messages": [HumanMessage(content=user_query)],
+        "user_intent": None,
+        "requirements_output": None,
+        "testcases_output": None,
+        "error": None,
+        "iteration_count": 0,
+        "max_iterations": 5,
+        "session_id": thread_id,
+        "timestamp": datetime.now().isoformat(),
+        "human_feedback": None,
+        "parallel_tasks": [],
+        "approved": None,
+        "metadata": {},
+        "uploaded_files": files,
+        "requirements_document": None,
+        "testcases_document": None,
+        "support_documents": [],
+        "execution_mode": None
+    }
+    
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": 25
+    }
+    
+    # First run - will halt at interrupt (human_review node)
+    print(f"Session ID: {thread_id}")
+    print("-" * 60)
+    
+    try:
+        for event in graph.stream(initial_state, config):
+            for node_name, node_state in event.items():
+                print(f"\n[Node: {node_name}]")
+                
+                if "messages" in node_state and node_state["messages"]:
+                    last_msg = node_state["messages"][-1]
+                    if hasattr(last_msg, "content"):
+                        content = str(last_msg.content)[:300]
+                        print(f"Output: {content}...")
+                
+                if "requirements_output" in node_state and node_state["requirements_output"]:
+                    print("\n✅ Requirements generated successfully!")
+    except Exception as e:
+        # Check if it's an interrupt
+        pass
+    
+    # Check current state
+    state_snapshot = graph.get_state(config)
+    
+    if not state_snapshot:
+        print("❌ No state found.")
+        return None
+    
+    current_state = state_snapshot.values
+    next_nodes = state_snapshot.next
+    
+    # Check if we're at human_review interrupt
+    if next_nodes and "human_review" in next_nodes:
+        requirements = current_state.get("requirements_output", {})
+        
+        print("\n" + "=" * 60)
+        print("🛑 HUMAN REVIEW REQUIRED")
+        print("=" * 60)
+        
+        # Display requirements for review
+        if requirements:
+            print("\n📋 Generated Requirements:")
+            print("-" * 40)
+            try:
+                req_display = json.dumps(requirements, indent=2)
+                if len(req_display) > 2000:
+                    req_display = req_display[:2000] + "\n... (truncated)"
+                print(req_display)
+            except:
+                print(str(requirements)[:2000])
+            print("-" * 40)
+        
+        print("\nDo you approve the generated requirements?")
+        choice = input("Type 'y' or 'approve' to continue to test cases, 'n' or 'reject' to end: ").strip().lower()
+        
+        approved = choice in ["y", "yes", "approve", "ok", "continue"]
+        feedback = ""
+        
+        if not approved:
+            feedback = input("Enter rejection feedback (optional): ").strip()
+        
+        # Update state with approval decision
+        current_state["approved"] = approved
+        current_state["human_feedback"] = feedback
+        
+        # Update the state in the graph
+        graph.update_state(config, current_state)
+        
+        # Resume execution
+        print(f"\n▶ {'Approved - Continuing to test case generation...' if approved else 'Rejected - Ending process...'}\n")
+        
+        for event in graph.stream(None, config):
+            for node_name, node_state in event.items():
+                print(f"\n[Node: {node_name}]")
+                
+                if "messages" in node_state and node_state["messages"]:
+                    last_msg = node_state["messages"][-1]
+                    if hasattr(last_msg, "content"):
+                        content = str(last_msg.content)[:300]
+                        print(f"Output: {content}...")
+                
+                if "testcases_output" in node_state and node_state["testcases_output"]:
+                    print("\n✅ Test cases generated successfully!")
+    
+    # Get final state
+    final_state_snapshot = graph.get_state(config)
+    final_state = final_state_snapshot.values if final_state_snapshot else current_state
+    
+    # Print final summary
+    print("\n" + "=" * 60)
+    print("✅ WORKFLOW COMPLETE")
+    print("=" * 60)
+    print(f"Requirements Generated: {bool(final_state.get('requirements_output'))}")
+    print(f"Approved: {final_state.get('approved')}")
+    print(f"Test Cases Generated: {bool(final_state.get('testcases_output'))}")
+    print(f"Session ID: {thread_id}")
+    print("=" * 60)
+    
+    return final_state, thread_id
+
+
+# ============================================================================
+# STREAMING AND CALLBACKS
+# ============================================================================
+
+class CustomCallback:
+    """
+    FEATURE: Custom callback for streaming events
+    """
+    def __init__(self):
+        self.events = []
+    
+    def on_node_start(self, node_name: str):
+        event = {
+            "type": "node_start",
+            "node": node_name,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.events.append(event)
+        print(f"[CALLBACK] Node started: {node_name}")
+    
+    def on_node_end(self, node_name: str, output: dict):
+        event = {
+            "type": "node_end",
+            "node": node_name,
+            "timestamp": datetime.now().isoformat(),
+            "output_keys": list(output.keys())
+        }
+        self.events.append(event)
+        print(f"[CALLBACK] Node completed: {node_name}")
+    
+    def get_events(self):
+        return self.events
+
+
+# ============================================================================
+# EXAMPLE USAGE WITH NEW FEATURES
+# ============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "="*80)
+    print("LANGGRAPH v1.0 MULTI-SCENARIO EXECUTION DEMONSTRATION")
+    print("="*80)
+    
+    # ========================================================================
+    # SCENARIO 1: Single document, generate both (Sequential)
+    # ========================================================================
+    print("\n" + "="*80)
+    print("SCENARIO 1: Single document - Generate both requirements and test cases")
+    print("Execution Mode: SEQUENTIAL (requirements first, then test cases)")
+    print("="*80)
+    
+    # doc1 = {
+    #     "name": "login_feature.txt",
+    #     "type": "text",
+    #     "content": """Login Feature Specification:
+    #     The system should allow users to login with username and password.
+    #     Password must be encrypted using bcrypt.
+    #     After 3 failed login attempts, the account should be locked for 15 minutes.
+    #     Users should be able to reset password via email.
+    #     Session timeout should be 30 minutes of inactivity."""
+    # }
+    
+    doc1 = {
+        "name": "ts.pdf",
+        "type": "pdf",
+        "content": r"c:\Users\dasan\OneDrive - Broadridge Financial Solutions, Inc\Projects\DeepAgents\Backend\ts.pdf"
+    }
+    
+    #query1 = "Generate requirements and test cases from this document"
+    query1 = "Generate requirements from this document" 
+    result1, session1 = run_agent(query1, uploaded_files=[doc1])
+    print("\n\nFinal Response:")
+    print(result1["messages"][-1].content)
+    # print(f"\nExecution Mode Used: {result1.get('execution_mode')}")
+    # print(f"Requirements Generated: {bool(result1.get('requirements_output'))}")
+    # print(f"Test Cases Generated: {bool(result1.get('testcases_output'))}")
+    
+    
+    # # ========================================================================
+    # # SCENARIO 2: Two documents, generate both (Parallel)
+    # # ========================================================================
+    # print("\n\n" + "="*80)
+    # print("SCENARIO 2: Two documents - Generate both in parallel")
+    # print("Execution Mode: PARALLEL (independent execution)")
+    # print("="*80)
+    
+    # doc2_req = {
+    #     "name": "shopping_cart_requirements.txt",
+    #     "type": "text",
+    #     "content": """Shopping Cart Requirements:
+    #     Users can add items to cart with quantities.
+    #     Users can update item quantities.
+    #     Users can remove items from cart.
+    #     Cart total must calculate automatically.
+    #     Cart should persist across sessions."""
+    # }
+    
+    # doc2_tc = {
+    #     "name": "payment_test_scenarios.txt",
+    #     "type": "text",
+    #     "content": """Payment Test Scenarios:
+    #     Test successful payment with valid credit card.
+    #     Test payment decline with insufficient funds.
+    #     Test payment with expired card.
+    #     Test payment with invalid CVV.
+    #     Test refund processing."""
+    # }
+    
+    # query2 = """I have two documents:
+    # - Document 1: Requirements for shopping cart
+    # - Document 2: Test scenarios for payment
+    
+    # Please generate requirements from document 1 and test cases from document 2 in parallel."""
+    
+    # result2, session2 = run_agent(query2, uploaded_files=[doc2_req, doc2_tc])
+    # print("\n\nFinal Response:")
+    # print(result2["messages"][-1].content)
+    # print(f"\nExecution Mode Used: {result2.get('execution_mode')}")
+    # print(f"Parallel Tasks: {result2.get('parallel_tasks')}")
+    
+    
+    # # ========================================================================
+    # # SCENARIO 3: Single document, generate requirements only
+    # # ========================================================================
+    # print("\n\n" + "="*80)
+    # print("SCENARIO 3: Single document - Generate requirements only")
+    # print("Execution Mode: INDEPENDENT (single task)")
+    # print("="*80)
+    
+    # doc3 = {
+    #     "name": "search_feature.txt",
+    #     "type": "text",
+    #     "content": """Search Feature:
+    #     Users can search products by name, category, or description.
+    #     Search should support autocomplete.
+    #     Search results should be paginated (20 items per page).
+    #     Users can filter results by price range and availability."""
+    # }
+    
+    # query3 = "Create requirements from this search feature document."
+    
+    # result3, session3 = run_agent(query3, uploaded_files=[doc3])
+    # print("\n\nFinal Response:")
+    # print(result3["messages"][-1].content)
+    # print(f"\nExecution Mode Used: {result3.get('execution_mode')}")
+    # print(f"Requirements Generated: {bool(result3.get('requirements_output'))}")
+    # print(f"Test Cases Generated: {bool(result3.get('testcases_output'))}")
+    
+    
+    # # ========================================================================
+    # # SCENARIO 4: Existing requirements, generate test cases only
+    # # ========================================================================
+    # print("\n\n" + "="*80)
+    # print("SCENARIO 4: Generate test cases from existing requirements")
+    # print("Execution Mode: INDEPENDENT (single task)")
+    # print("="*80)
+    
+    # query4 = """Generate test cases for these requirements:
+    # REQ-001: User must be able to add items to cart
+    # REQ-002: User must be able to update item quantities
+    # REQ-003: User must be able to remove items from cart
+    # REQ-004: Cart total must update automatically
+    # REQ-005: Cart must persist across sessions"""
+    
+    # result4, session4 = run_agent(query4, uploaded_files=[])
+    # print("\n\nFinal Response:")
+    # print(result4["messages"][-1].content)
+    # print(f"\nExecution Mode Used: {result4.get('execution_mode')}")
+    # print(f"Requirements Generated: {bool(result4.get('requirements_output'))}")
+    # print(f"Test Cases Generated: {bool(result4.get('testcases_output'))}")
+    
+    
+    # # ========================================================================
+    # # SCENARIO 5: Document for test cases only (independent)
+    # # ========================================================================
+    # print("\n\n" + "="*80)
+    # print("SCENARIO 5: Document for test cases only")
+    # print("Execution Mode: INDEPENDENT (test cases from document)")
+    # print("="*80)
+    
+    # doc5 = {
+    #     "name": "api_test_spec.txt",
+    #     "type": "text",
+    #     "content": """API Test Specification:
+    #     Test GET /users endpoint returns user list.
+    #     Test POST /users creates new user.
+    #     Test PUT /users/{id} updates user.
+    #     Test DELETE /users/{id} deletes user.
+    #     Test authentication with valid token.
+    #     Test authentication with invalid token."""
+    # }
+    
+    # query5 = "Generate test cases from this API specification document."
+    
+    # result5, session5 = run_agent(query5, uploaded_files=[doc5])
+    # print("\n\nFinal Response:")
+    # print(result5["messages"][-1].content)
+    # print(f"\nExecution Mode Used: {result5.get('execution_mode')}")
+    
+    
+    # # ========================================================================
+    # # SCENARIO 6: With Support Documents (User Guides, Setup Guides)
+    # # ========================================================================
+    # print("\n\n" + "="*80)
+    # print("SCENARIO 6: Primary documents + Support documents")
+    # print("Support documents provide additional context for better generation")
+    # print("="*80)
+    
+    # # Primary document for requirements
+    # doc6_primary = {
+    #     "name": "api_specification.txt",
+    #     "type": "text",
+    #     "content": """API Specification:
+    #     REST API for user management system.
+    #     Endpoints: GET /users, POST /users, PUT /users/{id}, DELETE /users/{id}
+    #     Authentication required via JWT token.
+    #     Rate limiting: 100 requests per minute per IP.
+    #     Response format: JSON.""",
+    #     "description": "Main API specification for requirements"
+    # }
+    
+    # # Support document 1: User Guide
+    # doc6_support1 = {
+    #     "name": "user_guide.pdf",
+    #     "type": "pdf",
+    #     "content": """User Guide:
+    #     Users must authenticate before accessing any endpoints.
+    #     Token expires after 1 hour.
+    #     Users can have roles: admin, editor, viewer.
+    #     Admin users can perform all operations.
+    #     Editor users can create and update.
+    #     Viewer users can only read.""",
+    #     "description": "User guide for reference"
+    # }
+    
+    # # Support document 2: Setup Guide
+    # doc6_support2 = {
+    #     "name": "setup_guide.pdf",
+    #     "type": "pdf",
+    #     "content": """Setup and Configuration:
+    #     Environment variables required: DB_HOST, DB_PORT, JWT_SECRET
+    #     Database: PostgreSQL 13+
+    #     Redis required for rate limiting
+    #     HTTPS required in production
+    #     CORS enabled for whitelisted domains""",
+    #     "description": "Setup guide for context"
+    # }
+    
+    # query6 = """Generate requirements and test cases from the API specification.
+    # Use the user guide and setup guide as reference for better context and completeness."""
+    
+    # result6, session6 = run_agent(
+    #     query6, 
+    #     uploaded_files=[doc6_primary, doc6_support1, doc6_support2]
+    # )
+    # print("\n\nFinal Response:")
+    # print(result6["messages"][-1].content)
+    # print(f"\nExecution Mode Used: {result6.get('execution_mode')}")
+    # print(f"Support Documents Used: {len(result6.get('support_documents', []))}")
+    # if result6.get('support_documents'):
+    #     print("Support Documents:")
+    #     for doc in result6['support_documents']:
+    #         print(f"  - {doc.get('name')}: {doc.get('purpose')}")
+    
+    
+    # # ========================================================================
+    # # SCENARIO 7: Parallel execution WITH support documents
+    # # ========================================================================
+    # print("\n\n" + "="*80)
+    # print("SCENARIO 7: Two primary documents + Support documents (Parallel)")
+    # print("Both requirements and test cases use support documents")
+    # print("="*80)
+    
+    # doc7_req = {
+    #     "name": "feature_requirements.txt",
+    #     "type": "text",
+    #     "content": """Feature Requirements Document:
+    #     Payment processing feature.
+    #     Support credit cards, debit cards, and PayPal.
+    #     Implement refund functionality.
+    #     Transaction history tracking.""",
+    #     "description": "Primary document for requirements generation"
+    # }
+    
+    # doc7_tc = {
+    #     "name": "test_scenarios.txt",
+    #     "type": "text",
+    #     "content": """Test Scenarios Document:
+    #     Positive payment flows with different payment methods.
+    #     Negative scenarios: declined cards, insufficient funds.
+    #     Refund processing tests.
+    #     Edge cases: concurrent transactions, timeout handling.""",
+    #     "description": "Primary document for test case generation"
+    # }
+    
+    # doc7_support = {
+    #     "name": "payment_api_docs.pdf",
+    #     "type": "pdf",
+    #     "content": """Payment Gateway API Documentation:
+    #     Stripe API v2023-10
+    #     Card validation using Luhn algorithm
+    #     3D Secure authentication required
+    #     Webhook events for payment status
+    #     Idempotency keys for retry safety
+    #     PCI DSS compliance requirements""",
+    #     "description": "API documentation for reference"
+    # }
+    
+    # query7 = """I have three documents:
+    # 1. Feature requirements document - use for generating requirements
+    # 2. Test scenarios document - use for generating test cases
+    # 3. Payment API docs - use as reference for both
+    
+    # Generate requirements from doc 1 and test cases from doc 2 in parallel, 
+    # using the API docs for additional context."""
+    
+    # result7, session7 = run_agent(
+    #     query7,
+    #     uploaded_files=[doc7_req, doc7_tc, doc7_support]
+    # )
+    # print("\n\nFinal Response:")
+    # print(result7["messages"][-1].content)
+    # print(f"\nExecution Mode Used: {result7.get('execution_mode')}")
+    # print(f"Parallel Tasks: {result7.get('parallel_tasks')}")
+    
+    
+    # # ========================================================================
+    # # Summary
+    # # ========================================================================
+    # print("\n\n" + "="*80)
+    # print("DEMONSTRATION COMPLETE - ALL SCENARIOS INCLUDING SUPPORT DOCUMENTS")
+    # print("="*80)
+    # print("\n📋 Scenarios Demonstrated:")
+    # print("1. ✓ Single document → Both requirements & test cases (Sequential)")
+    # print("2. ✓ Two documents → Both in parallel (Parallel)")
+    # print("3. ✓ Single document → Requirements only (Independent)")
+    # print("4. ✓ Existing requirements → Test cases only (Independent)")
+    # print("5. ✓ Single document → Test cases only (Independent)")
+    # print("6. ✓ Primary + Support documents → Both (Sequential) [NEW]")
+    # print("7. ✓ Two primary + Support → Both (Parallel) [NEW]")
+    # print("\n🎯 Key Features:")
+    # print("✓ LLM-based intent analysis")
+    # print("✓ Automatic document classification (primary vs support)")
+    # print("✓ Support documents passed to tools")
+    # print("✓ Sequential execution (requirements → test cases)")
+    # print("✓ Parallel execution (independent documents)")
+    # print("✓ Enhanced context with user guides, setup guides, API docs")
+    # print("✓ Quality validation")
+    # print("✓ State persistence")
+    # print("="*80)
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph.message import add_messages
+
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from generate_token import generate_token
+# ============================================================================
+# STATE
+# ============================================================================
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+    # Outputs
+    requirements_output: Optional[dict]
+    testcases_output: Optional[dict]
+
+    # Human approval
+    human_approval_required: bool
+    human_approved: Optional[bool]
+    human_feedback: Optional[str]
+    process_terminated: bool
+
+    # Control
+    error: Optional[str]
+    iteration_count: int
+    max_iterations: int
+    session_id: str
+    timestamp: str
+    
+    # Document handling
+    uploaded_files: list[dict]  # List of uploaded documents with metadata
+    
+    # Execution mode: "requirements_only", "testcases_only", "sequential", "parallel"
+    execution_mode: Optional[str]
+    # Document for requirements generation
+    requirements_document: Optional[str]
+    # Document for test cases generation
+    testcases_document: Optional[str]
+
+
+# ============================================================================
+# MOCK TOOLS (replace with your real API calls)
+# ============================================================================
+
+def requirements_creation_tool(document: str, payload_options: dict) -> dict:
+    """
+    Requirements creation tool that calls the actual API endpoint.
+    
+    Args:
+        document: Source document file path (e.g., "ts.pdf") for requirements generation
+        payload_options: Additional options for the API call (currently unused)
+    
+    Returns:
+        dict: Generated requirements from the API
+    """
+    import requests
+    import mimetypes
+    import time
+    import os
+    
+    # API configuration
+    AXIOS_URL = "https://onboardgpt.broadridge.net:8884"
+    API_ENDPOINT = f"{AXIOS_URL}/generate-current-flow"
+    
+    # Hardcoded user details
+    user_name = "Anup Das"
+    user_email = "anup.das@example.com"
+    
+    # Build multipart form-data with proper content type
+    files = []
+    file_handles = []  # Keep track of file handles to close later
+    
+    # Add main document as a file upload
+    if document:
+        # Check if document is a file path
+        if isinstance(document, str) and os.path.exists(document):
+            # It's a file path - open and upload the actual file
+            mime_type, _ = mimetypes.guess_type(document)
+            if mime_type is None:
+                mime_type = "application/octet-stream"
+            file_handle = open(document, 'rb')
+            file_handles.append(file_handle)
+            files.append(('files', (os.path.basename(document), file_handle, mime_type)))
+            print(f"📄 Uploading file: {document} (MIME: {mime_type})")
+        else:
+            # It's text content - convert to file-like object
+            from io import BytesIO
+            doc_bytes = str(document).encode('utf-8')
+            doc_file = BytesIO(doc_bytes)
+            file_handles.append(doc_file)
+            files.append(('files', ('document.txt', doc_file, 'text/plain')))
+            print(f"📄 Uploading text content as document.txt")
+    
+    # Prepare form data (only user details, no document content here)
+    data = {
+        "userName": user_name,
+        "userEmail": user_email
+    }
+    
+    try:
+        # Record start time
+        start_time = time.time()
+        print(f"🚀 Sending requirements generation request to: {API_ENDPOINT}")
+        
+        response = requests.post(API_ENDPOINT, files=files, data=data, verify=False)
+        
+        # Record end time
+        end_time = time.time()
+        
+        response.raise_for_status()  # Raise error for bad status codes
+
+        # Calculate and display total time taken
+        total_time = end_time - start_time
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"⏱️ Requirements generation time: {minutes}:{seconds:06.3f}")
+        
+        # Parse response
+        response_data = response.json()
+        print("✅ Requirements generation completed successfully")
+        
+        # Close file handles
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        
+        # Return structured response
+        return {
+            "status": "success",
+            "requirements": response_data,
+            "metadata": {
+                "api_endpoint": API_ENDPOINT,
+                "files_uploaded": len(files),
+                "processing_time": f"{minutes}:{seconds:06.3f}",
+                "user_name": user_name,
+                "user_email": user_email
+            },
+            "raw_response": response_data
+        }
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error in requirements generation: {e}")
+        
+        # Close file handles in case of error
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+                
+        return {
+            "status": "error",
+            "error": str(e),
+            "metadata": {
+                "api_endpoint": API_ENDPOINT,
+                "files_attempted": len(files),
+                "user_name": user_name,
+                "user_email": user_email
+            }
+        }
+    except Exception as e:
+        print(f"❌ Unexpected error in requirements generation: {e}")
+        
+        # Close file handles in case of error
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+                
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "metadata": {
+                "files_attempted": len(files),
+                "user_name": user_name,
+                "user_email": user_email
+            }
+        }
+
+
+def test_case_generation_tool(requirements: dict, options: dict = None) -> dict:
+    """
+    Test case generation tool that calls the actual API endpoint.
+    
+    Supports two execution modes:
+    1. SEQUENTIAL: Requirements output (text) is passed via businessText field
+    2. PARALLEL/INDEPENDENT: User-uploaded files are passed as file objects
+    
+    Args:
+        requirements: Requirements from the requirements creation tool or document data
+            - For sequential: Contains "requirements" key with generated requirements
+            - For parallel/independent: Contains "document" key with file path or content
+        options: Additional generation options, including:
+            - execution_mode: "sequential", "parallel", or "independent"
+            - support_documents: List of support documents for context
+            - test_strategy: Testing strategy to apply
+            - product: Product name
+            - sub_products: List of sub-products
+    
+    Returns:
+        dict: Generated test cases from the API
+    """
+    import requests
+    import mimetypes
+    import time
+    import os
+    import re
+    from io import BytesIO
+    
+    options = options or {}
+    
+    # API configuration
+    API_URL = "https://testgenaiqa.broadridge.net:5000/generate-test-cases"
+    
+    # Hardcoded user details
+    name_test_gen = "System Agent"
+    email_test_gen = "agent@broadridge.com"
+    session_id = f"agent_session_{int(time.time())}"
+    
+    # Extract options
+    support_docs = options.get("support_documents", [])
+    product = options.get("product", "")
+    sub_products = options.get("sub_products", [])
+    execution_mode = options.get("execution_mode", "sequential")  # Default to sequential
+    
+    # Track file handles for cleanup
+    file_handles = []
+    
+    def sanitize_text(text: str) -> str:
+        """
+        Remove or escape control characters that cause JSON parsing issues.
+        Keeps newlines and tabs but removes other control characters.
+        """
+        if not text:
+            return ""
+        # Remove control characters except newline (\n), carriage return (\r), and tab (\t)
+        # Control characters are in ranges 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
+        sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        # Replace any remaining problematic characters
+        sanitized = sanitized.replace('\r\n', '\n').replace('\r', '\n')
+        return sanitized
+    
+    # Determine execution mode based on requirements structure
+    is_sequential = False
+    if isinstance(requirements, dict):
+        # If requirements contains output from requirements_creation_tool, it's sequential
+        if "requirements" in requirements and requirements.get("status") == "success":
+            is_sequential = True
+        # If execution_mode is explicitly set, use that
+        if execution_mode in ["parallel", "independent"]:
+            is_sequential = False
+        elif execution_mode == "sequential":
+            is_sequential = True
+    
+    print(f"📋 Execution Mode: {'SEQUENTIAL (text-based)' if is_sequential else 'PARALLEL/INDEPENDENT (file-based)'}")
+    
+    # Prepare multipart files section
+    files = []
+    
+    # Prepare form data
+    business_text = ""
+    reference_text = ""
+    
+    if is_sequential:
+        # =====================================================================
+        # SEQUENTIAL MODE: Pass requirements output as text in businessText
+        # =====================================================================
+        print("📝 Using text-based approach for sequential execution")
+        
+        # Extract requirements text from the requirements output
+        if isinstance(requirements, dict):
+            if "requirements" in requirements:
+                # Requirements from requirements generation tool
+                req_data = requirements.get("requirements", {})
+                if isinstance(req_data, dict):
+                    # Safely convert to JSON string
+                    try:
+                        business_text = json.dumps(req_data, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        business_text = str(req_data)
+                elif isinstance(req_data, str):
+                    business_text = req_data
+                else:
+                    business_text = str(req_data)
+            elif "raw_response" in requirements:
+                # Use raw response if available
+                raw = requirements.get("raw_response", {})
+                if isinstance(raw, dict):
+                    try:
+                        business_text = json.dumps(raw, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        business_text = str(raw)
+                else:
+                    business_text = str(raw)
+            else:
+                # Try to convert entire dict to JSON
+                try:
+                    business_text = json.dumps(requirements, ensure_ascii=False, indent=2)
+                except (TypeError, ValueError):
+                    business_text = str(requirements)
+        else:
+            business_text = str(requirements)
+        
+        # Sanitize business text
+        business_text = sanitize_text(business_text)
+        
+        # For sequential mode, support docs are also passed as text in referenceText
+        if support_docs:
+            reference_texts = []
+            for doc in support_docs:
+                if isinstance(doc, dict):
+                    doc_name = doc.get("name", "")
+                    doc_content = doc.get("content", "")
+                    purpose = doc.get("purpose", "")
+                    
+                    # Check if content is a file path
+                    if isinstance(doc_content, str) and os.path.exists(doc_content):
+                        # Read file content for text-based mode
+                        try:
+                            with open(doc_content, 'r', encoding='utf-8', errors='ignore') as f:
+                                doc_content = f.read()
+                        except Exception as e:
+                            print(f"⚠️ Could not read support doc file {doc_content}: {e}")
+                            doc_content = ""
+                    
+                    doc_content = sanitize_text(str(doc_content))
+                    if doc_content:
+                        reference_texts.append(f"Document: {doc_name}\nPurpose: {purpose}\nContent: {doc_content}")
+                else:
+                    reference_texts.append(sanitize_text(str(doc)))
+            reference_text = "\n\n---\n\n".join(reference_texts)
+        
+        # Sanitize reference text
+        reference_text = sanitize_text(reference_text)
+        
+    else:
+        # =====================================================================
+        # PARALLEL/INDEPENDENT MODE: Pass files as file objects
+        # =====================================================================
+        print("📁 Using file-based approach for parallel/independent execution")
+        
+        # Handle main business document as file
+        if isinstance(requirements, dict):
+            doc_content = requirements.get("document", requirements.get("content", ""))
+            doc_name = requirements.get("name", "business_document")
+            
+            if doc_content:
+                # Check if it's a file path
+                if isinstance(doc_content, str) and os.path.exists(doc_content):
+                    # It's a file path - open and upload the actual file
+                    mime_type, _ = mimetypes.guess_type(doc_content)
+                    if mime_type is None:
+                        mime_type = "application/octet-stream"
+                    file_handle = open(doc_content, 'rb')
+                    file_handles.append(file_handle)
+                    files.append(('businessDoc', (os.path.basename(doc_content), file_handle, mime_type)))
+                    print(f"📄 Uploading business document file: {doc_content} (MIME: {mime_type})")
+                else:
+                    # It's text content - convert to file-like object
+                    doc_bytes = str(doc_content).encode('utf-8')
+                    doc_file = BytesIO(doc_bytes)
+                    file_handles.append(doc_file)
+                    
+                    # Determine file extension
+                    if doc_name.endswith(('.pdf', '.doc', '.docx', '.txt')):
+                        filename = doc_name
+                    else:
+                        filename = f"{doc_name}.txt"
+                    
+                    files.append(('businessDoc', (filename, doc_file, 'text/plain')))
+                    print(f"📄 Uploading text content as: {filename}")
+        
+        # Handle support documents as files
+        if support_docs:
+            for idx, doc in enumerate(support_docs):
+                if isinstance(doc, dict):
+                    doc_name = doc.get("name", f"support_doc_{idx}")
+                    doc_content = doc.get("content", "")
+                    
+                    if doc_content:
+                        # Check if it's a file path
+                        if isinstance(doc_content, str) and os.path.exists(doc_content):
+                            # It's a file path - open and upload the actual file
+                            mime_type, _ = mimetypes.guess_type(doc_content)
+                            if mime_type is None:
+                                mime_type = "application/octet-stream"
+                            file_handle = open(doc_content, 'rb')
+                            file_handles.append(file_handle)
+                            files.append(('referenceDoc', (os.path.basename(doc_content), file_handle, mime_type)))
+                            print(f"📄 Uploading support document file: {doc_content} (MIME: {mime_type})")
+                        else:
+                            # It's text content - convert to file-like object
+                            doc_bytes = str(doc_content).encode('utf-8')
+                            doc_file = BytesIO(doc_bytes)
+                            file_handles.append(doc_file)
+                            
+                            # Determine file extension
+                            if doc_name.endswith(('.pdf', '.doc', '.docx', '.txt')):
+                                filename = doc_name
+                            else:
+                                filename = f"{doc_name}.txt"
+                            
+                            files.append(('referenceDoc', (filename, doc_file, 'text/plain')))
+                            print(f"📄 Uploading support doc content as: {filename}")
+    
+    # Prepare form data using tuples for repeated fields
+    data_tuples = [
+        ('businessText', business_text),
+        ('referenceText', reference_text),
+        ('product', product),
+        ('nameTestGen', name_test_gen),
+        ('emailTestGen', email_test_gen),
+        ('sessionId', session_id)
+    ]
+    
+    # Add subProduct[] fields
+    for sub in sub_products:
+        data_tuples.append(('subProduct[]', sub))
+    
+    try:
+        # Record start time
+        start_time = time.time()
+        print(f"🚀 Sending test case generation request to: {API_URL}")
+        print(f"   - Files attached: {len(files)}")
+        print(f"   - Business text length: {len(business_text)} chars")
+        print(f"   - Reference text length: {len(reference_text)} chars")
+        
+        response = requests.post(API_URL, files=files if files else None, data=data_tuples, verify=False)
+        
+        # Record end time
+        end_time = time.time()
+        
+        response.raise_for_status()  # Raise error for bad status codes
+        
+        # Calculate and display total time taken
+        total_time = end_time - start_time
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"⏱️ Test case generation time: {minutes}:{seconds:06.3f}")
+        
+        # Parse response - handle potential JSON issues
+        try:
+            # First, try to get the raw text and sanitize it
+            response_text = response.text
+            # Remove any BOM or other problematic characters
+            response_text = response_text.lstrip('\ufeff')
+            # Sanitize the response text
+            response_text = sanitize_text(response_text)
+            response_data = json.loads(response_text)
+        except json.JSONDecodeError as json_err:
+            print(f"⚠️ JSON parsing error: {json_err}")
+            # Try to extract JSON from response
+            response_text = response.text
+            # Look for JSON object in the response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                try:
+                    response_data = json.loads(sanitize_text(json_match.group()))
+                except json.JSONDecodeError:
+                    # Return raw response as string
+                    response_data = {"raw_response": response_text, "parse_error": str(json_err)}
+            else:
+                response_data = {"raw_response": response_text, "parse_error": str(json_err)}
+        
+        print("✅ Test case generation completed successfully")
+        
+        # Close file handles
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        
+        # Return structured response
+        return {
+            "status": "success",
+            "test_cases": response_data,
+            "metadata": {
+                "api_endpoint": API_URL,
+                "execution_mode": "sequential" if is_sequential else "parallel/independent",
+                "files_uploaded": len(files),
+                "support_documents_used": len(support_docs),
+                "processing_time": f"{minutes}:{seconds:06.3f}",
+                "product": product,
+                "sub_products_count": len(sub_products),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            },
+            "raw_response": response_data
+        }
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error in test case generation: {e}")
+        
+        # Close file handles in case of error
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "metadata": {
+                "api_endpoint": API_URL,
+                "execution_mode": "sequential" if is_sequential else "parallel/independent",
+                "files_attempted": len(files),
+                "support_documents_attempted": len(support_docs),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            }
+        }
+    except Exception as e:
+        print(f"❌ Unexpected error in test case generation: {e}")
+        
+        # Close file handles in case of error
+        for _, file_tuple in files:
+            if len(file_tuple) >= 2 and hasattr(file_tuple[1], 'close'):
+                file_tuple[1].close()
+        
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "metadata": {
+                "support_documents_attempted": len(support_docs),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            }
+        }
+
+
+# ============================================================================
+# AGENT NODES
+# ============================================================================
+
+def agent_planner(state: AgentState) -> AgentState:
+    """
+    Decides what should happen next based on execution mode.
+    Handles: requirements_only, testcases_only, sequential, parallel modes.
+    """
+    execution_mode = state.get("execution_mode", "sequential")
+    requirements_output = state.get("requirements_output")
+    testcases_output = state.get("testcases_output")
+    human_approved = state.get("human_approved")
+    human_approval_required = state.get("human_approval_required")
+    
+    # TESTCASES ONLY MODE - skip requirements entirely
+    if execution_mode == "testcases_only":
+        if not testcases_output:
+            return {
+                **state,
+                "messages": [AIMessage("Generating test cases from document...")],
+            }
+        return state
+    
+    # REQUIREMENTS ONLY MODE
+    if execution_mode == "requirements_only":
+        if not requirements_output:
+            return {
+                **state,
+                "messages": [AIMessage("Generating requirements...")],
+            }
+        return state
+    
+    # PARALLEL MODE - both run independently
+    if execution_mode == "parallel":
+        if not requirements_output and not testcases_output:
+            return {
+                **state,
+                "messages": [AIMessage("Generating requirements and test cases in parallel...")],
+            }
+        return state
+    
+    # SEQUENTIAL MODE (default) - requirements first, then test cases
+    if not requirements_output:
+        return {
+            **state,
+            "messages": [AIMessage("Generating requirements...")],
+        }
+
+    if human_approval_required and human_approved is None:
+        return state
+
+    if human_approved and not testcases_output:
+        return {
+            **state,
+            "messages": [AIMessage("Generating test cases using existing requirements...")],
+        }
+    
+    if requirements_output and testcases_output:
+        return {
+            **state,
+            "messages": [AIMessage("Both requirements and test cases have been generated.")],
+        }
+
+    return state
+
+
+def requirements_node(state: AgentState) -> AgentState:
+    # Get uploaded files from state
+    uploaded_files = state.get("uploaded_files", [])
+    
+    # Determine document to use
+    document = None
+    if uploaded_files:
+        # Use the first uploaded file's content (path)
+        first_file = uploaded_files[0]
+        document = first_file.get("content") or first_file.get("path") or first_file.get("name")
+        print(f"📄 Using document: {document}")
+    else:
+        print("⚠️ No uploaded files found, using empty document")
+        document = ""
+    
+    result = requirements_creation_tool(document, {})
+
+    return {
+        **state,
+        "requirements_output": result,
+        "human_approval_required": True,
+        "messages": [AIMessage("✅ Requirements generated.")],
+    }
+
+
+def testcases_node(state: AgentState) -> AgentState:
+    """
+    Generate test cases.
+    Can work from:
+    1. Existing requirements (sequential mode)
+    2. Directly from a document (testcases_only or parallel mode)
+    """
+    execution_mode = state.get("execution_mode", "sequential")
+    requirements = state.get("requirements_output")
+    testcases_doc = state.get("testcases_document")
+    uploaded_files = state.get("uploaded_files", [])
+    
+    # Determine input source based on execution mode
+    if execution_mode in ["testcases_only", "parallel"]:
+        # Use testcases_document or first uploaded file directly
+        document = testcases_doc
+        if not document and uploaded_files:
+            # For testcases_only, use the first uploaded file
+            first_file = uploaded_files[0]
+            document = first_file.get("content") or first_file.get("path") or first_file.get("name")
+        
+        if not document:
+            return {
+                **state,
+                "error": "No document available for test case generation",
+                "messages": [AIMessage("❌ Cannot generate test cases: No document found.")],
+            }
+        
+        print(f"🧪 Generating test cases directly from document: {document}")
+        # Pass document as a dict structure that test_case_generation_tool expects
+        result = test_case_generation_tool(
+            {"document": document, "name": "uploaded_document"},
+            {"execution_mode": "independent"}
+        )
+    else:
+        # Sequential mode - use requirements output
+        if not requirements:
+            return {
+                **state,
+                "error": "No requirements available for test case generation",
+                "messages": [AIMessage("❌ Cannot generate test cases: No requirements found.")],
+            }
+        
+        print(f"🧪 Generating test cases from existing requirements...")
+        print(f"   Requirements status: {requirements.get('status', 'unknown')}")
+        
+        result = test_case_generation_tool(requirements)
+
+    return {
+        **state,
+        "testcases_output": result,
+        "messages": [AIMessage("✅ Test cases generated.")],
+    }
+
+
+# ============================================================================
+# HUMAN‑IN‑THE‑LOOP (CLEAN v1.0 PATTERN)
+# ============================================================================
+
+def human_approval_prompt_node(state: AgentState) -> AgentState:
+    """
+    DISPLAY ONLY – shows requirements and pauses execution.
+    """
+    reqs = state["requirements_output"]
+
+    message = AIMessage(
+        content=f"""
+📋 **REQUIREMENTS GENERATED – APPROVAL REQUIRED**
+    Reply with:
+- **approve / yes** → continue to test case generation
+- **reject / no** → stop the process
+"""
+    )
+
+    return {
+        **state,
+        "messages": [message],
+        "human_approval_required": True,
+        "human_approved": None,
+    }
+
+
+def human_approval_execute_node(state: AgentState) -> AgentState:
+    """
+    LOGIC ONLY – runs after resume.
+    """
+    feedback = (state.get("human_feedback") or "").lower().strip()
+
+    if feedback in {"reject", "no"}:
+        return {
+            **state,
+            "human_approved": False,
+            "process_terminated": True,
+            "messages": [
+                AIMessage("❌ Requirements rejected. Process terminated.")
+            ],
+        }
+
+    return {
+        **state,
+        "human_approved": True,
+        "human_approval_required": False,
+        "messages": [
+            AIMessage("✅ Requirements approved. Proceeding...")
+        ],
+    }
+
+
+# ============================================================================
+# ROUTING
+# ============================================================================
+
+def route_from_agent(state: AgentState) -> Literal[
+    "requirements", "human_approval_prompt", "testcases", "parallel_execution", "end"
+]:
+    execution_mode = state.get("execution_mode", "sequential")
+    requirements_output = state.get("requirements_output")
+    testcases_output = state.get("testcases_output")
+    human_approved = state.get("human_approved")
+    human_approval_required = state.get("human_approval_required")
+    
+    # TESTCASES ONLY MODE - go directly to testcases
+    if execution_mode == "testcases_only":
+        if not testcases_output:
+            print("📋 Testcases-only mode: Generating test cases from document")
+            return "testcases"
+        return "end"
+    
+    # REQUIREMENTS ONLY MODE
+    if execution_mode == "requirements_only":
+        if not requirements_output:
+            return "requirements"
+        return "end"
+    
+    # PARALLEL MODE - execute both in parallel
+    if execution_mode == "parallel":
+        if not requirements_output and not testcases_output:
+            print("📋 Parallel mode: Generating requirements and test cases simultaneously")
+            return "parallel_execution"
+        return "end"
+    
+    # SEQUENTIAL MODE (default)
+    # No requirements yet - generate them
+    if not requirements_output:
+        return "requirements"
+
+    # Requirements exist but need approval (and not pre-approved)
+    if human_approval_required and human_approved is None:
+        return "human_approval_prompt"
+
+    # Requirements exist and approved (including pre-approved follow-ups) - generate test cases
+    if human_approved and not testcases_output:
+        print("📋 Using existing requirements for test case generation")
+        return "testcases"
+    
+    # Both exist - done
+    if requirements_output and testcases_output:
+        return "end"
+
+    return "end"
+
+
+def route_after_approval(state: AgentState) -> Literal["agent", "end"]:
+    if state.get("process_terminated"):
+        return "end"
+    return "agent"
+
+
+# ============================================================================
+# PARALLEL EXECUTION NODE
+# ============================================================================
+
+def parallel_execution_node(state: AgentState) -> AgentState:
+    """
+    Execute both requirements and test cases generation in parallel.
+    Uses separate documents for each task.
+    """
+    import concurrent.futures
+    
+    requirements_doc = state.get("requirements_document")
+    testcases_doc = state.get("testcases_document")
+    uploaded_files = state.get("uploaded_files", [])
+    
+    # If documents not explicitly assigned, use first two uploaded files
+    if not requirements_doc and len(uploaded_files) >= 1:
+        first_file = uploaded_files[0]
+        requirements_doc = first_file.get("content") or first_file.get("path") or first_file.get("name")
+    
+    if not testcases_doc and len(uploaded_files) >= 2:
+        second_file = uploaded_files[1]
+        testcases_doc = second_file.get("content") or second_file.get("path") or second_file.get("name")
+    
+    print(f"🔄 Parallel execution started")
+    print(f"   Requirements doc: {requirements_doc}")
+    print(f"   Test cases doc: {testcases_doc}")
+    
+    requirements_result = None
+    testcases_result = None
+    errors = []
+    
+    # Execute both in parallel using ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {}
+        
+        if requirements_doc:
+            futures["requirements"] = executor.submit(
+                requirements_creation_tool, requirements_doc, {}
+            )
+        
+        if testcases_doc:
+            futures["testcases"] = executor.submit(
+                test_case_generation_tool,
+                {"document": testcases_doc, "name": "testcases_document"},
+                {"execution_mode": "independent"}
+            )
+        
+        # Collect results
+        for task_name, future in futures.items():
+            try:
+                result = future.result(timeout=300)  # 5 minute timeout
+                if task_name == "requirements":
+                    requirements_result = result
+                    print("✅ Requirements generation completed")
+                else:
+                    testcases_result = result
+                    print("✅ Test cases generation completed")
+            except Exception as e:
+                error_msg = f"{task_name} failed: {str(e)}"
+                errors.append(error_msg)
+                print(f"❌ {error_msg}")
+    
+    return {
+        **state,
+        "requirements_output": requirements_result,
+        "testcases_output": testcases_result,
+        "error": "; ".join(errors) if errors else None,
+        "messages": [AIMessage("✅ Parallel execution completed. Both requirements and test cases generated.")],
+    }
+
+
+# ============================================================================
+# GRAPH
+# ============================================================================
+
+# Shared memory instance for state persistence across function calls
+_shared_memory = MemorySaver()
+
+
+def create_agent_graph():
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("agent", agent_planner)
+    workflow.add_node("requirements", requirements_node)
+    workflow.add_node("human_approval_prompt", human_approval_prompt_node)
+    workflow.add_node("human_approval_execute", human_approval_execute_node)
+    workflow.add_node("testcases", testcases_node)
+    workflow.add_node("parallel_execution", parallel_execution_node)
+
+    workflow.add_edge(START, "agent")
+
+    workflow.add_conditional_edges(
+        "agent",
+        route_from_agent,
+        {
+            "requirements": "requirements",
+            "human_approval_prompt": "human_approval_prompt",
+            "testcases": "testcases",
+            "parallel_execution": "parallel_execution",
+            "end": END,
+        },
+    )
+
+    workflow.add_edge("requirements", "agent")
+    workflow.add_edge("human_approval_prompt", "human_approval_execute")
+    
+    # Parallel execution goes directly to END
+    workflow.add_edge("parallel_execution", END)
+
+    workflow.add_conditional_edges(
+        "human_approval_execute",
+        route_after_approval,
+        {
+            "agent": "agent",
+            "end": END,
+        },
+    )
+
+    workflow.add_edge("testcases", END)
+
+    return workflow.compile(
+        checkpointer=_shared_memory,
+        interrupt_before=["human_approval_execute"],
+    )
+
+
+# ============================================================================
+# RUN / RESUME
+# ============================================================================
+
+def run_agent(user_query: str = "Generate requirements and test cases", uploaded_files: list = None):
+    """
+    Run the agent with a user query.
+    
+    Args:
+        user_query: The user's message/query to process
+        uploaded_files: List of uploaded file dicts with 'name', 'type', 'content' keys
+    
+    Returns:
+        session_id: The session ID for resuming later
+    """
+    graph = create_agent_graph()
+    session_id = str(uuid.uuid4())
+
+    initial_state: AgentState = {
+        "messages": [HumanMessage(content=user_query)],
+        "requirements_output": None,
+        "testcases_output": None,
+        "human_approval_required": False,
+        "human_approved": None,
+        "human_feedback": None,
+        "process_terminated": False,
+        "error": None,
+        "iteration_count": 0,
+        "max_iterations": 5,
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+        "uploaded_files": uploaded_files or [],
+    }
+
+    config = {"configurable": {"thread_id": session_id}}
+
+    for event in graph.stream(initial_state, config):
+        for node_name, node_state in event.items():
+            if isinstance(node_state, dict) and node_state.get("messages"):
+                print(node_state["messages"][-1].content)
+
+    return session_id
+
+
+def resume_agent_with_approval(session_id: str, approval_response: str):
+    graph = create_agent_graph()
+    config = {"configurable": {"thread_id": session_id}}
+
+    snapshot = graph.get_state(config)
+    
+    if not snapshot or not snapshot.values:
+        print("❌ No state found for this session.")
+        return
+    
+    state = dict(snapshot.values)  # Make a copy of the state
+
+    state["human_feedback"] = approval_response
+    
+    # Safely append to messages
+    if "messages" not in state:
+        state["messages"] = []
+    state["messages"].append(HumanMessage(content=approval_response))
+
+    graph.update_state(config, state)
+
+    for event in graph.stream(None, config):
+        for _, s in event.items():
+            if isinstance(s, dict) and s.get("messages"):
+                print(s["messages"][-1].content)
+
+
+# ============================================================================
+# DEMO
+# ============================================================================
+
+if __name__ == "__main__":
+    session_id = run_agent()
+
+    print("\n⏸️ WAITING FOR APPROVAL\n")
+
+     # Get actual user input
+    user_response = input("Type 'approve' or 'reject': ").strip()
+    resume_agent_with_approval(session_id, user_response)
