@@ -1,0 +1,1002 @@
+# ============================================================================
+# ENHANCED LANGGRAPH v1.0 – PRODUCTION-READY AGENT WITH LLM-BASED INTENT INFERENCE
+# ============================================================================
+from typing import TypedDict, Optional, Literal, Annotated
+from datetime import datetime
+import json
+import uuid
+import hashlib
+import time
+import concurrent.futures
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import requests
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+)
+from langchain_openai import ChatOpenAI  # Ensure OPENAI_API_KEY is set
+from generate_token import generate_token
+import os
+
+# Ensure OpenAI API key is available
+if not os.getenv("OPENAI_API_KEY"):
+    raise EnvironmentError("OPENAI_API_KEY environment variable is required for LLM-based intent inference.")
+
+# ============================================================================
+# STATE DEFINITION
+# ============================================================================
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    # Outputs
+    requirements_output: Optional[dict]
+    testcases_output: Optional[dict]
+    # Human approval
+    human_approval_required: bool
+    human_approved: Optional[bool]
+    human_feedback: Optional[str]
+    process_terminated: bool
+    # Control
+    error: Optional[str]
+    iteration_count: int
+    max_iterations: int
+    session_id: str
+    timestamp: str
+    # Document handling
+    uploaded_files: list[dict]
+    # Execution mode
+    execution_mode: Optional[str]
+    requirements_document: Optional[str]
+    testcases_document: Optional[str]
+    # Progress tracking (NEW)
+    progress: Optional[dict]
+    # Intent cache (NEW)
+    intent_cache_key: Optional[str]
+    # Retry tracking (NEW)
+    retry_count: dict
+
+
+# ============================================================================
+# LLM-BASED EXECUTION MODE INFERENCE
+# ============================================================================
+def infer_execution_mode(query: str) -> str:
+    """
+    Use an LLM to infer execution mode from user query.
+    Returns one of: 'requirements_only', 'testcases_only', 'sequential', 'parallel'
+    Fallback to 'sequential' on error.
+    """
+    try:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, max_tokens=10)
+
+        system_prompt = (
+            "You are an intent classifier for a software requirements and test case generation agent. "
+            "Based ONLY on the user's query, determine the execution mode. "
+            "Respond with EXACTLY ONE of these four words: "
+            "'requirements_only', 'testcases_only', 'sequential', or 'parallel'. "
+            "Do not explain, do not add punctuation, do not use quotes."
+        )
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=query.strip())
+        ]
+
+        response = llm.invoke(messages)
+        raw_output = response.content.strip().lower()
+
+        valid_modes = {"requirements_only", "testcases_only", "sequential", "parallel"}
+        if raw_output in valid_modes:
+            print(f"🧠 LLM inferred execution mode: '{raw_output}' from query: '{query}'")
+            return raw_output
+        else:
+            print(f"⚠️ LLM returned invalid mode: '{raw_output}'. Defaulting to 'sequential'.")
+            return "sequential"
+
+    except Exception as e:
+        print(f"❌ Error in LLM-based intent inference: {e}. Falling back to 'sequential'.")
+        return "sequential"
+
+
+# ============================================================================
+# ENHANCED TOOL FUNCTIONS WITH RETRY LOGIC
+# ============================================================================
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(requests.exceptions.RequestException)
+)
+def requirements_creation_tool(document: str, payload_options: dict) -> dict:
+    """
+    Requirements creation tool with retry logic.
+    """
+    import mimetypes
+    import os
+    from io import BytesIO
+    AXIOS_URL = "https://onboardgpt.broadridge.net:8884"
+    API_ENDPOINT = f"{AXIOS_URL}/generate-current-flow"
+    user_name = "Anup Das"
+    user_email = "anup.das@example.com"
+    files = []
+    file_handles = []
+    if document:
+        if isinstance(document, str) and os.path.exists(document):
+            mime_type, _ = mimetypes.guess_type(document)
+            if mime_type is None:
+                mime_type = "application/octet-stream"
+            file_handle = open(document, 'rb')
+            file_handles.append(file_handle)
+            files.append(('files', (os.path.basename(document), file_handle, mime_type)))
+            print(f"📄 Uploading file: {document} (MIME: {mime_type})")
+        else:
+            doc_bytes = str(document).encode('utf-8')
+            doc_file = BytesIO(doc_bytes)
+            file_handles.append(doc_file)
+            files.append(('files', ('document.txt', doc_file, 'text/plain')))
+            print(f"📄 Uploading text content as document.txt")
+    data = {
+        "userName": user_name,
+        "userEmail": user_email
+    }
+    try:
+        start_time = time.time()
+        print(f"🚀 Sending requirements generation request to: {API_ENDPOINT}")
+        response = requests.post(API_ENDPOINT, files=files, data=data, verify=False, timeout=600)
+        response.raise_for_status()
+        end_time = time.time()
+        total_time = end_time - start_time
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"⏱️ Requirements generation time: {minutes}:{seconds:06.3f}")
+        response_data = response.json()
+        print("✅ Requirements generation completed successfully")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        return {
+            "status": "success",
+            "requirements": response_data,
+            "metadata": {
+                "api_endpoint": API_ENDPOINT,
+                "files_uploaded": len(files),
+                "processing_time": f"{minutes}:{seconds:06.3f}",
+                "user_name": user_name,
+                "user_email": user_email
+            },
+            "raw_response": response_data
+        }
+    except requests.exceptions.Timeout:
+        print(f"❌ Timeout error in requirements generation")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        raise  # Will trigger retry
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error in requirements generation: {e}")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        raise  # Will trigger retry
+    except Exception as e:
+        print(f"❌ Unexpected error in requirements generation: {e}")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "metadata": {
+                "files_attempted": len(files),
+                "user_name": user_name,
+                "user_email": user_email
+            }
+        }
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(requests.exceptions.RequestException)
+)
+def test_case_generation_tool(requirements: dict, options: dict = None) -> dict:
+    """
+    Test case generation tool with retry logic.
+    """
+    import mimetypes
+    import os
+    import re
+    from io import BytesIO
+    options = options or {}
+    API_URL = "https://testgenaiqa.broadridge.net:5000/generate-test-cases"
+    name_test_gen = "System Agent"
+    email_test_gen = "agent@broadridge.com"
+    session_id = f"agent_session_{int(time.time())}"
+    support_docs = options.get("support_documents", [])
+    product = options.get("product", "")
+    sub_products = options.get("sub_products", [])
+    execution_mode = options.get("execution_mode", "sequential")
+    file_handles = []
+
+    def sanitize_text(text: str) -> str:
+        if not text:
+            return ""
+        sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        sanitized = sanitized.replace('\r\n', '\n').replace('\r', '\n')
+        return sanitized
+
+    is_sequential = False
+    if isinstance(requirements, dict):
+        if "requirements" in requirements and requirements.get("status") == "success":
+            is_sequential = True
+    if execution_mode in ["parallel", "independent"]:
+        is_sequential = False
+    elif execution_mode == "sequential":
+        is_sequential = True
+
+    print(f"📋 Execution Mode: {'SEQUENTIAL (text-based)' if is_sequential else 'PARALLEL/INDEPENDENT (file-based)'}")
+
+    files = []
+    business_text = ""
+    reference_text = ""
+
+    if is_sequential:
+        print("📝 Using text-based approach for sequential execution")
+        if isinstance(requirements, dict):
+            if "requirements" in requirements:
+                req_data = requirements.get("requirements", {})
+                if isinstance(req_data, dict):
+                    try:
+                        business_text = json.dumps(req_data, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        business_text = str(req_data)
+                elif isinstance(req_data, str):
+                    business_text = req_data
+                else:
+                    business_text = str(req_data)
+            elif "raw_response" in requirements:
+                raw = requirements.get("raw_response", {})
+                if isinstance(raw, dict):
+                    try:
+                        business_text = json.dumps(raw, ensure_ascii=False, indent=2)
+                    except (TypeError, ValueError):
+                        business_text = str(raw)
+                else:
+                    business_text = str(raw)
+            else:
+                try:
+                    business_text = json.dumps(requirements, ensure_ascii=False, indent=2)
+                except (TypeError, ValueError):
+                    business_text = str(requirements)
+        else:
+            business_text = str(requirements)
+
+        business_text = sanitize_text(business_text)
+
+        if support_docs:
+            reference_texts = []
+            for doc in support_docs:
+                if isinstance(doc, dict):
+                    doc_name = doc.get("name", "")
+                    doc_content = doc.get("content", "")
+                    purpose = doc.get("purpose", "")
+                    if isinstance(doc_content, str) and os.path.exists(doc_content):
+                        try:
+                            with open(doc_content, 'r', encoding='utf-8', errors='ignore') as f:
+                                doc_content = f.read()
+                        except Exception as e:
+                            print(f"⚠️ Could not read support doc file {doc_content}: {e}")
+                            doc_content = ""
+                    doc_content = sanitize_text(str(doc_content))
+                    if doc_content:
+                        reference_texts.append(f"Document: {doc_name}\nPurpose: {purpose}\nContent: {doc_content}")
+                    else:
+                        reference_texts.append(sanitize_text(str(doc)))
+            reference_text = "\n---\n".join(reference_texts)
+            reference_text = sanitize_text(reference_text)
+    else:
+        print("📁 Using file-based approach for parallel/independent execution")
+        if isinstance(requirements, dict):
+            doc_content = requirements.get("document", requirements.get("content", ""))
+            doc_name = requirements.get("name", "business_document")
+            if doc_content:
+                if isinstance(doc_content, str) and os.path.exists(doc_content):
+                    mime_type, _ = mimetypes.guess_type(doc_content)
+                    if mime_type is None:
+                        mime_type = "application/octet-stream"
+                    file_handle = open(doc_content, 'rb')
+                    file_handles.append(file_handle)
+                    files.append(('businessDoc', (os.path.basename(doc_content), file_handle, mime_type)))
+                    print(f"📄 Uploading business document file: {doc_content} (MIME: {mime_type})")
+                else:
+                    doc_bytes = str(doc_content).encode('utf-8')
+                    doc_file = BytesIO(doc_bytes)
+                    file_handles.append(doc_file)
+                    if doc_name.endswith(('.pdf', '.doc', '.docx', '.txt')):
+                        filename = doc_name
+                    else:
+                        filename = f"{doc_name}.txt"
+                    files.append(('businessDoc', (filename, doc_file, 'text/plain')))
+                    print(f"📄 Uploading text content as: {filename}")
+
+        if support_docs:
+            for idx, doc in enumerate(support_docs):
+                if isinstance(doc, dict):
+                    doc_name = doc.get("name", f"support_doc_{idx}")
+                    doc_content = doc.get("content", "")
+                    if doc_content:
+                        if isinstance(doc_content, str) and os.path.exists(doc_content):
+                            mime_type, _ = mimetypes.guess_type(doc_content)
+                            if mime_type is None:
+                                mime_type = "application/octet-stream"
+                            file_handle = open(doc_content, 'rb')
+                            file_handles.append(file_handle)
+                            files.append(('referenceDoc', (os.path.basename(doc_content), file_handle, mime_type)))
+                            print(f"📄 Uploading support document file: {doc_content} (MIME: {mime_type})")
+                        else:
+                            doc_bytes = str(doc_content).encode('utf-8')
+                            doc_file = BytesIO(doc_bytes)
+                            file_handles.append(doc_file)
+                            if doc_name.endswith(('.pdf', '.doc', '.docx', '.txt')):
+                                filename = doc_name
+                            else:
+                                filename = f"{doc_name}.txt"
+                            files.append(('referenceDoc', (filename, doc_file, 'text/plain')))
+                            print(f"📄 Uploading support doc content as: {filename}")
+
+    data_tuples = [
+        ('businessText', business_text),
+        ('referenceText', reference_text),
+        ('product', product),
+        ('nameTestGen', name_test_gen),
+        ('emailTestGen', email_test_gen),
+        ('sessionId', session_id)
+    ]
+    for sub in sub_products:
+        data_tuples.append(('subProduct[]', sub))
+
+    try:
+        start_time = time.time()
+        print(f"🚀 Sending test case generation request to: {API_URL}")
+        print(f"   - Files attached: {len(files)}")
+        print(f"   - Business text length: {len(business_text)} chars")
+        print(f"   - Reference text length: {len(reference_text)} chars")
+        response = requests.post(API_URL, files=files if files else None, data=data_tuples, verify=False, timeout=600)
+        response.raise_for_status()
+        end_time = time.time()
+        total_time = end_time - start_time
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"⏱️ Test case generation time: {minutes}:{seconds:06.3f}")
+
+        try:
+            response_text = response.text
+            response_text = response_text.lstrip('\ufeff')
+            response_text = sanitize_text(response_text)
+            response_data = json.loads(response_text)
+        except json.JSONDecodeError as json_err:
+            print(f"⚠️ JSON parsing error: {json_err}")
+            response_text = response.text
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                try:
+                    response_data = json.loads(sanitize_text(json_match.group()))
+                except json.JSONDecodeError:
+                    response_data = {"raw_response": response_text, "parse_error": str(json_err)}
+            else:
+                response_data = {"raw_response": response_text, "parse_error": str(json_err)}
+
+        print("✅ Test case generation completed successfully")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        return {
+            "status": "success",
+            "test_cases": response_data,
+            "metadata": {
+                "api_endpoint": API_URL,
+                "execution_mode": "sequential" if is_sequential else "parallel/independent",
+                "files_uploaded": len(files),
+                "support_documents_used": len(support_docs),
+                "processing_time": f"{minutes}:{seconds:06.3f}",
+                "product": product,
+                "sub_products_count": len(sub_products),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            },
+            "raw_response": response_data
+        }
+    except requests.exceptions.Timeout:
+        print(f"❌ Timeout error in test case generation")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        raise  # Will trigger retry
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error in test case generation: {e}")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        raise  # Will trigger retry
+    except Exception as e:
+        print(f"❌ Unexpected error in test case generation: {e}")
+        for fh in file_handles:
+            if hasattr(fh, 'close'):
+                fh.close()
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "metadata": {
+                "support_documents_attempted": len(support_docs),
+                "session_id": session_id,
+                "name_test_gen": name_test_gen,
+                "email_test_gen": email_test_gen
+            }
+        }
+
+
+# ============================================================================
+# ENHANCED AGENT NODES
+# ============================================================================
+def agent_planner(state: AgentState) -> AgentState:
+    execution_mode = state.get("execution_mode", "sequential")
+    requirements_output = state.get("requirements_output")
+    testcases_output = state.get("testcases_output")
+    human_approved = state.get("human_approved")
+    human_approval_required = state.get("human_approval_required")
+
+    progress = {
+        "requirements_generated": bool(requirements_output),
+        "requirements_approved": bool(human_approved),
+        "testcases_generated": bool(testcases_output),
+        "current_step": None
+    }
+
+    if execution_mode == "testcases_only":
+        progress["current_step"] = "testcases"
+        if not testcases_output:
+            return {
+                **state,
+                "messages": [AIMessage("Generating test cases from document...")],
+                "progress": progress
+            }
+        progress["current_step"] = "complete"
+        return {**state, "progress": progress}
+
+    if execution_mode == "requirements_only":
+        progress["current_step"] = "requirements"
+        if not requirements_output:
+            return {
+                **state,
+                "messages": [AIMessage("Generating requirements...")],
+                "progress": progress
+            }
+        progress["current_step"] = "complete"
+        return {**state, "progress": progress}
+
+    if execution_mode == "parallel":
+        progress["current_step"] = "parallel"
+        if not requirements_output and not testcases_output:
+            return {
+                **state,
+                "messages": [AIMessage("Generating requirements and test cases in parallel...")],
+                "progress": progress
+            }
+        progress["current_step"] = "complete"
+        return {**state, "progress": progress}
+
+    if not requirements_output:
+        progress["current_step"] = "requirements"
+        return {
+            **state,
+            "messages": [AIMessage("Generating requirements...")],
+            "progress": progress
+        }
+    if human_approval_required and human_approved is None:
+        progress["current_step"] = "approval"
+        return {**state, "progress": progress}
+    if human_approved and not testcases_output:
+        progress["current_step"] = "testcases"
+        return {
+            **state,
+            "messages": [AIMessage("Generating test cases using existing requirements...")],
+            "progress": progress
+        }
+    if requirements_output and testcases_output:
+        progress["current_step"] = "complete"
+        return {
+            **state,
+            "messages": [AIMessage("Both requirements and test cases have been generated.")],
+            "progress": progress
+        }
+    return {**state, "progress": progress}
+
+
+def requirements_node(state: AgentState) -> AgentState:
+    uploaded_files = state.get("uploaded_files", [])
+    retry_count = state.get("retry_count", {})
+    document = None
+    if uploaded_files:
+        first_file = uploaded_files[0]
+        document = first_file.get("content") or first_file.get("path") or first_file.get("name")
+        print(f"📄 Using document: {document}")
+    else:
+        print("⚠️ No uploaded files found, using empty document")
+        document = ""
+
+    try:
+        result = requirements_creation_tool(document, {})
+        retry_count["requirements"] = 0
+        return {
+            **state,
+            "requirements_output": result,
+            "human_approval_required": True,
+            "messages": [AIMessage("✅ Requirements generated.")],
+            "retry_count": retry_count,
+            "error": None
+        }
+    except Exception as e:
+        retry_count["requirements"] = retry_count.get("requirements", 0) + 1
+        return {
+            **state,
+            "error": f"Requirements generation failed after retries: {str(e)}",
+            "messages": [AIMessage(f"❌ Error: {str(e)}")],
+            "retry_count": retry_count
+        }
+
+
+def testcases_node(state: AgentState) -> AgentState:
+    execution_mode = state.get("execution_mode", "sequential")
+    requirements = state.get("requirements_output")
+    testcases_doc = state.get("testcases_document")
+    uploaded_files = state.get("uploaded_files", [])
+    retry_count = state.get("retry_count", {})
+
+    try:
+        if execution_mode in ["testcases_only", "parallel"]:
+            document = testcases_doc
+            if not document and uploaded_files:
+                first_file = uploaded_files[0]
+                document = first_file.get("content") or first_file.get("path") or first_file.get("name")
+            if not document:
+                return {
+                    **state,
+                    "error": "No document available for test case generation",
+                    "messages": [AIMessage("❌ Cannot generate test cases: No document found.")],
+                }
+            print(f"🧪 Generating test cases directly from document: {document}")
+            result = test_case_generation_tool(
+                {"document": document, "name": "uploaded_document"},
+                {"execution_mode": "independent"}
+            )
+        else:
+            if not requirements:
+                return {
+                    **state,
+                    "error": "No requirements available for test case generation",
+                    "messages": [AIMessage("❌ Cannot generate test cases: No requirements found.")],
+                }
+            print(f"🧪 Generating test cases from existing requirements...")
+            result = test_case_generation_tool(requirements)
+
+        retry_count["testcases"] = 0
+        return {
+            **state,
+            "testcases_output": result,
+            "messages": [AIMessage("✅ Test cases generated.")],
+            "retry_count": retry_count,
+            "error": None
+        }
+    except Exception as e:
+        retry_count["testcases"] = retry_count.get("testcases", 0) + 1
+        return {
+            **state,
+            "error": f"Test case generation failed after retries: {str(e)}",
+            "messages": [AIMessage(f"❌ Error: {str(e)}")],
+            "retry_count": retry_count
+        }
+
+
+# ============================================================================
+# HUMAN-IN-THE-LOOP NODES
+# ============================================================================
+def human_approval_prompt_node(state: AgentState) -> AgentState:
+    message = AIMessage(
+        content=f"""
+📋 **REQUIREMENTS GENERATED – APPROVAL REQUIRED**
+✅ Generation completed successfully!
+Reply with:
+- **approve** / **yes** / **y** → continue to test case generation
+- **reject** / **no** / **n** → stop the process
+Your response:
+"""
+    )
+    return {
+        **state,
+        "messages": [message],
+        "human_approval_required": True,
+        "human_approved": None,
+    }
+
+
+def human_approval_execute_node(state: AgentState) -> AgentState:
+    feedback = (state.get("human_feedback") or "").lower().strip()
+    reject_keywords = {"reject", "no", "n", "deny", "stop", "cancel"}
+    approve_keywords = {"approve", "yes", "y", "accept", "continue", "ok", "proceed"}
+
+    if any(kw in feedback for kw in reject_keywords):
+        return {
+            **state,
+            "human_approved": False,
+            "process_terminated": True,
+            "messages": [AIMessage("❌ Requirements rejected. Process terminated.")],
+        }
+    elif any(kw in feedback for kw in approve_keywords):
+        return {
+            **state,
+            "human_approved": True,
+            "human_approval_required": False,
+            "messages": [AIMessage("✅ Requirements approved. Proceeding to test case generation...")],
+        }
+    else:
+        return {
+            **state,
+            "messages": [AIMessage("⚠️ Unclear response. Please respond with 'approve' or 'reject'")],
+        }
+
+
+# ============================================================================
+# PARALLEL EXECUTION
+# ============================================================================
+def parallel_execution_node(state: AgentState) -> AgentState:
+    requirements_doc = state.get("requirements_document")
+    testcases_doc = state.get("testcases_document")
+    uploaded_files = state.get("uploaded_files", [])
+    retry_count = state.get("retry_count", {})
+
+    if not requirements_doc and len(uploaded_files) >= 1:
+        first_file = uploaded_files[0]
+        requirements_doc = first_file.get("content") or first_file.get("path") or first_file.get("name")
+    if not testcases_doc and len(uploaded_files) >= 2:
+        second_file = uploaded_files[1]
+        testcases_doc = second_file.get("content") or second_file.get("path") or second_file.get("name")
+
+    print(f"🔄 Parallel execution started")
+    print(f"   Requirements doc: {requirements_doc}")
+    print(f"   Test cases doc: {testcases_doc}")
+
+    requirements_result = None
+    testcases_result = None
+    errors = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {}
+        if requirements_doc:
+            futures["requirements"] = executor.submit(
+                requirements_creation_tool, requirements_doc, {}
+            )
+        if testcases_doc:
+            futures["testcases"] = executor.submit(
+                test_case_generation_tool,
+                {"document": testcases_doc, "name": "testcases_document"},
+                {"execution_mode": "independent"}
+            )
+
+        for task_name, future in futures.items():
+            try:
+                result = future.result(timeout=600)
+                if task_name == "requirements":
+                    requirements_result = result
+                    retry_count["requirements"] = 0
+                    print("✅ Requirements generation completed")
+                else:
+                    testcases_result = result
+                    retry_count["testcases"] = 0
+                    print("✅ Test cases generation completed")
+            except concurrent.futures.TimeoutError:
+                error_msg = f"{task_name} timed out after 10 minutes"
+                errors.append(error_msg)
+                retry_count[task_name] = retry_count.get(task_name, 0) + 1
+                print(f"⏱️ {error_msg}")
+            except Exception as e:
+                error_msg = f"{task_name} failed: {str(e)}"
+                errors.append(error_msg)
+                retry_count[task_name] = retry_count.get(task_name, 0) + 1
+                print(f"❌ {error_msg}")
+
+    return {
+        **state,
+        "requirements_output": requirements_result,
+        "testcases_output": testcases_result,
+        "error": "; ".join(errors) if errors else None,
+        "retry_count": retry_count,
+        "messages": [AIMessage("✅ Parallel execution completed. Both requirements and test cases generated." if not errors else f"⚠️ Parallel execution completed with errors: {'; '.join(errors)}")],
+    }
+
+
+# ============================================================================
+# ERROR HANDLER NODE
+# ============================================================================
+def error_handler_node(state: AgentState) -> AgentState:
+    error = state.get("error", "Unknown error occurred")
+    retry_count = state.get("retry_count", {})
+
+    if "timeout" in error.lower():
+        message = f"""⏱️ **TIMEOUT ERROR**
+The process timed out. This can happen with large documents or slow network.
+Retry attempts: {retry_count}
+Would you like to:
+1. Retry the operation
+2. Try with a smaller document
+3. End the process
+Reply with: retry / smaller / end
+"""
+    elif "api" in error.lower() or "connection" in error.lower():
+        message = f"""🔌 **API CONNECTION ERROR**
+Cannot connect to the API endpoint.
+Retry attempts: {retry_count}
+Please check:
+- Network connection
+- API endpoint status
+- Firewall settings
+Reply with: retry / end
+"""
+    else:
+        message = f"""❌ **ERROR OCCURRED**
+{error}
+Retry attempts: {retry_count}
+Reply with: retry / end
+"""
+    return {
+        **state,
+        "messages": [AIMessage(message)],
+    }
+
+
+# ============================================================================
+# ROUTING FUNCTIONS
+# ============================================================================
+def route_from_agent(state: AgentState) -> Literal[
+    "requirements", "human_approval_prompt", "testcases", "parallel_execution", "error_handler", "end"
+]:
+    execution_mode = state.get("execution_mode", "sequential")
+    requirements_output = state.get("requirements_output")
+    testcases_output = state.get("testcases_output")
+    human_approved = state.get("human_approved")
+    human_approval_required = state.get("human_approval_required")
+    error = state.get("error")
+
+    if error:
+        return "error_handler"
+
+    if execution_mode == "testcases_only":
+        if not testcases_output:
+            print("📋 Testcases-only mode: Generating test cases from document")
+            return "testcases"
+        return "end"
+
+    if execution_mode == "requirements_only":
+        if not requirements_output:
+            return "requirements"
+        return "end"
+
+    if execution_mode == "parallel":
+        if not requirements_output and not testcases_output:
+            print("📋 Parallel mode: Generating requirements and test cases simultaneously")
+            return "parallel_execution"
+        return "end"
+
+    if not requirements_output:
+        return "requirements"
+    if human_approval_required and human_approved is None:
+        return "human_approval_prompt"
+    if human_approved and not testcases_output:
+        print("📋 Using existing requirements for test case generation")
+        return "testcases"
+    if requirements_output and testcases_output:
+        return "end"
+    return "end"
+
+
+def route_after_approval(state: AgentState) -> Literal["agent", "end"]:
+    if state.get("process_terminated"):
+        return "end"
+    if state.get("error"):
+        return "end"
+    return "agent"
+
+
+def route_from_error(state: AgentState) -> Literal["agent", "end"]:
+    feedback = (state.get("human_feedback") or "").lower().strip()
+    if "retry" in feedback:
+        return "agent"
+    return "end"
+
+
+# ============================================================================
+# GRAPH CONSTRUCTION
+# ============================================================================
+_shared_memory = MemorySaver()
+
+
+def create_agent_graph():
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", agent_planner)
+    workflow.add_node("requirements", requirements_node)
+    workflow.add_node("human_approval_prompt", human_approval_prompt_node)
+    workflow.add_node("human_approval_execute", human_approval_execute_node)
+    workflow.add_node("testcases", testcases_node)
+    workflow.add_node("parallel_execution", parallel_execution_node)
+    workflow.add_node("error_handler", error_handler_node)
+
+    workflow.add_edge(START, "agent")
+    workflow.add_conditional_edges(
+        "agent",
+        route_from_agent,
+        {
+            "requirements": "requirements",
+            "human_approval_prompt": "human_approval_prompt",
+            "testcases": "testcases",
+            "parallel_execution": "parallel_execution",
+            "error_handler": "error_handler",
+            "end": END,
+        },
+    )
+    workflow.add_edge("requirements", "agent")
+    workflow.add_edge("human_approval_prompt", "human_approval_execute")
+    workflow.add_edge("parallel_execution", END)
+    workflow.add_conditional_edges(
+        "human_approval_execute",
+        route_after_approval,
+        {
+            "agent": "agent",
+            "end": END,
+        },
+    )
+    workflow.add_edge("testcases", END)
+    workflow.add_conditional_edges(
+        "error_handler",
+        route_from_error,
+        {
+            "agent": "agent",
+            "end": END,
+        },
+    )
+    return workflow.compile(
+        checkpointer=_shared_memory,
+        interrupt_before=["human_approval_execute"],
+    )
+
+
+# ============================================================================
+# RUN / RESUME FUNCTIONS
+# ============================================================================
+def run_agent(user_query: str = "Generate requirements and test cases", uploaded_files: list = None, execution_mode: str = None):
+    """
+    Run agent with optional explicit execution_mode.
+    If None, uses LLM to infer from user_query.
+    """
+    if execution_mode is None:
+        execution_mode = infer_execution_mode(user_query)
+
+    graph = create_agent_graph()
+    session_id = str(uuid.uuid4())
+
+    files_hash = hashlib.md5(
+        json.dumps([f.get("name", "") for f in (uploaded_files or [])]).encode()
+    ).hexdigest()
+    intent_cache_key = f"{user_query}_{files_hash}"
+
+    initial_state: AgentState = {
+        "messages": [HumanMessage(content=user_query)],
+        "requirements_output": None,
+        "testcases_output": None,
+        "human_approval_required": False,
+        "human_approved": None,
+        "human_feedback": None,
+        "process_terminated": False,
+        "error": None,
+        "iteration_count": 0,
+        "max_iterations": 5,
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+        "uploaded_files": uploaded_files or [],
+        "execution_mode": execution_mode,
+        "requirements_document": None,
+        "testcases_document": None,
+        "progress": None,
+        "intent_cache_key": intent_cache_key,
+        "retry_count": {}
+    }
+
+    config = {"configurable": {"thread_id": session_id}}
+
+    print(f"\n{'='*80}")
+    print(f"SESSION STARTED: {session_id}")
+    print(f"Execution Mode: {execution_mode} (inferred by LLM)")
+    print(f"{'='*80}\n")
+
+    for event in graph.stream(initial_state, config):
+        for node_name, node_state in event.items():
+            print(f"\n[{node_name.upper()}]")
+            if isinstance(node_state, dict):
+                if node_state.get("messages"):
+                    print(node_state["messages"][-1].content)
+                if node_state.get("progress"):
+                    progress = node_state["progress"]
+                    print(f"\n📊 Progress:")
+                    print(f"   - Requirements: {'✓' if progress.get('requirements_generated') else '⏳'}")
+                    print(f"   - Approval: {'✓' if progress.get('requirements_approved') else '⏳'}")
+                    print(f"   - Test Cases: {'✓' if progress.get('testcases_generated') else '⏳'}")
+                    print(f"   - Current Step: {progress.get('current_step', 'N/A')}")
+
+    print(f"\n{'='*80}")
+    print(f"SESSION ID: {session_id}")
+    print(f"{'='*80}\n")
+    return session_id
+
+
+def resume_agent_with_approval(session_id: str, approval_response: str):
+    graph = create_agent_graph()
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = graph.get_state(config)
+    if not snapshot or not snapshot.values:
+        print("❌ No state found for this session.")
+        return
+    state = dict(snapshot.values)
+    state["human_feedback"] = approval_response
+    if "messages" not in state:
+        state["messages"] = []
+    state["messages"].append(HumanMessage(content=approval_response))
+    graph.update_state(config, state)
+
+    print(f"\n{'='*80}")
+    print(f"RESUMING SESSION: {session_id}")
+    print(f"{'='*80}\n")
+
+    for event in graph.stream(None, config):
+        for node_name, node_state in event.items():
+            print(f"\n[{node_name.upper()}]")
+            if isinstance(node_state, dict) and node_state.get("messages"):
+                print(node_state["messages"][-1].content)
+
+
+def get_session_progress(session_id: str) -> dict:
+    graph = create_agent_graph()
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = graph.get_state(config)
+    if not snapshot or not snapshot.values:
+        return {"error": "Session not found"}
+    state = snapshot.values
+    return {
+        "progress": state.get("progress"),
+        "retry_count": state.get("retry_count"),
+        "error": state.get("error"),
+        "execution_mode": state.get("execution_mode")
+    }
+
+
+# ============================================================================
+# DEMO / MAIN
+# ============================================================================
+if __name__ == "__main__":
+    print("\n" + "="*80)
+    print("ENHANCED LANGGRAPH v1.0 WITH LLM-BASED INTENT INFERENCE")
+    print("="*80)
+    print("\n✨ New Feature:")
+    print("  ✓ Execution mode inferred by LLM (not regex)")
+    print("="*80 + "\n")
+
+    doc1 = {
+        "name": "ts.pdf",
+        "type": "pdf",
+        "content": r"c:\Users\dasan\OneDrive - Broadridge Financial Solutions, Inc\Projects\DeepAgents\Backend\ts.pdf"
+    }
+    query1 = "Generate requirements from this document"
+    session_id = run_agent(query1, uploaded_files=[doc1])  # No execution_mode passed!
+
+    progress = get_session_progress(session_id)
+    print(f"\n📊 Current Progress: {json.dumps(progress, indent=2)}")
+    print("\n⏸️ WAITING FOR APPROVAL (if required)\n")
