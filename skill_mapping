@@ -1,0 +1,3058 @@
+.env 
+-----------------------
+# =============================================================
+# Skill Mapping API — Environment Configuration
+# =============================================================
+
+# --- Embedding API  ---
+EMBED_API_URL=open_ai_url_for_embeddings_model # Replace with the embedding-3-large model endpoint url
+EMBED_MODEL_NAME=text-embedding-3-large
+EMBED_DIM=3072
+EMBED_APPLICATION_TYPE=Developer
+EMBED_API_KEY="XX"
+
+# --- Local Embedding Model (all-MiniLM-L6-v2) ---
+# Path to the local sentence-transformers model directory (relative or absolute)
+LOCAL_EMBED_MODEL_PATH=all-MiniLM-L6-v2
+LOCAL_EMBED_DIM=384
+
+# --- LLM Model Parameters ---
+LLM_MODEL_NAME=gpt-5.2
+LLM_MAX_TOKENS=20000
+
+# --- Data Paths ---
+DB_PATH=enterprise_employee.db
+INDEX_DIR=faiss_indexes
+EMPLOYEE_DATA_PATH=employee_data.pkl
+
+******************************************************************************************
+
+llm.client.py
+-----------------------
+
+# llm_client.py
+# ---------------------------------------------------------------------------
+# Handles communication with the LLM endpoint.
+# 1. Builds the prompt using the template from prompt.py.
+# 2. Sends the request and validates the JSON response against schema.py.
+# ---------------------------------------------------------------------------
+
+import json
+import requests
+from prompt import EXTRACTION_PROMPT
+from schema import ProjectExtraction
+
+
+def extract_project_metadata(text: str) -> dict:
+    """
+    Send raw project-requirement text to the LLM and return validated
+    structured metadata as a plain dict.
+
+    Returns a dict with an 'error' key when extraction or validation fails,
+    so the caller can display a user-friendly message.
+    """
+
+    # --- 1. Build the prompt ------------------------------------------------
+    # .format() replaces {text} with the user input; literal braces in the
+    # template are already doubled {{ }} to avoid KeyError.
+    prompt = EXTRACTION_PROMPT.format(text=text)
+
+    # --- 2. Authenticate ----------------------------------------------------
+    api_key = "XXX"
+    if not api_key:
+        return {
+            "error": "Invalid Token",
+            "details": "check credentials",
+            "raw_output": ""
+        }
+
+    # --- 3. Call the LLM endpoint -------------------------------------------
+    headers = {
+        "Content-Type": "application/json",
+        "applicationType": "Replace_Accordingly",
+        "Authorization": f"Bearer {api_key}"
+    }
+    data = {
+        "messages": [{"role": "user", "content": prompt}],
+        "model": "gpt-5.2",
+        "max_tokens": 5000,
+    }
+
+    response = requests.post(endpoint_url, json=data, headers=headers, timeout=300)
+
+    # --- 4. Handle HTTP-level errors ----------------------------------------
+    if response.status_code == 200:
+        raw = response.json()["choices"][0]["message"]["content"].strip()
+    else:
+        raise Exception(f"Error Generating Answer (HTTP {response.status_code}): {response.text}")
+
+    # --- 5. Parse & validate the LLM output against the Pydantic schema -----
+    try:
+        parsed = json.loads(raw)                 # raw JSON string → dict
+        validated = ProjectExtraction(**parsed)   # validate with Pydantic
+        return validated.dict()                   # return plain dict for Streamlit
+    except json.JSONDecodeError as e:
+        # LLM returned something that is not valid JSON
+        return {
+            "error": "JSON parsing failed",
+            "details": f"JSONDecodeError: {e}",
+            "raw_output": raw
+        }
+    except Exception as e:
+        # Pydantic validation or any other unexpected error
+        return {
+            "error": "Extraction failed",
+            "details": str(e),
+            "raw_output": raw
+        }
+		
+*******************************************************************************************************
+prompt.py
+----------------------
+# prompt.py
+# ---------------------------------------------------------------------------
+# Contains the extraction prompt sent to the LLM.  The JSON template inside
+# the prompt MUST stay in sync with the Pydantic models in schema.py.
+#
+# NOTE: Because we use Python str.format(text=...) to inject the user text,
+#       every literal brace in the prompt must be doubled  {{ }}  so that
+#       .format() does not treat them as placeholders.
+# ---------------------------------------------------------------------------
+
+EXTRACTION_PROMPT = """
+You are an enterprise AI system that extracts structured project requirement metadata
+from unstructured or semi-structured text.
+
+CRITICAL RULES:
+- Do NOT guess or invent information.
+- If a field is missing or unclear, return null.
+- Normalize skill names (e.g., "Python programming" → "Python").
+- Separate mandatory and optional skills.
+- Infer skill category using industry-standard labels listed below.
+- Experience must be numeric (years only).
+- Project criticality must be based ONLY on explicit signals.
+- Project duration must be in months; return null if not mentioned.
+
+Skill Categories (use only these):
+CORE_PROGRAMMING, AI_ML, DATA_ENGINEERING, DATABASE, FRAMEWORK, PLATFORM,
+ARCHITECTURE, DEVOPS, CLOUD, DOMAIN, TESTING_QA, UI_UX, BUSINESS_ANALYSIS,
+PROJECT_MANAGEMENT, ANALYTICS_BI, INTEGRATION, OTHER
+
+Skill Categorization Guidance:
+- Programming languages, python, java, node.js → PROGRAMMING
+- Machine Learning, NLP, Deep Learning → AI_ML
+- ETL, Spark, Kafka, Data Pipelines, Data Extraction → DATA_ENGINEERING
+- SQL, Oracle, PostgreSQL, MongoDB → DATABASE
+- Spring Boot, Django, React → FRAMEWORK
+- SAP, Salesforce, ServiceNow → PLATFORM
+- Microservices, System Design → ARCHITECTURE
+- CI/CD, Jenkins, Docker, kubernetes, Terraform → DEVOPS
+- AWS, Azure, GCP → CLOUD
+- IAM, OAuth, Encryption → SECURITY
+- Selenium, Automation Testing → TESTING_QA
+- Power BI, Tableau → ANALYTICS_BI 
+- Figma, UX Design → UI_UX
+- Requirement Gathering, BRD → BUSINESS_ANALYSIS
+- Agile, Scrum, PMP → PROJECT_MANAGEMENT
+- Power BI, Tableau → ANALYTICS_BI
+- Flask, FastAPI, REST, APIs, Middleware → INTEGRATION
+- Android, iOS, Flutter → MOBILE
+- Banking, Healthcare, Retail knowledge → DOMAIN
+- If none apply → OTHER
+
+Project Criticality Rules:
+- HIGH → regulatory, compliance, production, P0, revenue-impacting
+- MEDIUM → important business project
+- LOW → internal, POC, experimental
+- If unclear → null
+
+Return ONLY valid JSON in the following format:
+
+{{
+  "project_description": "",
+  "mandatory_skills": [
+    {{
+      "skill": "",
+      "category": "",
+      "min_experience_years": null
+    }}
+  ],
+  "optional_skills": [
+    {{
+      "skill": "",
+      "category": ""
+    }}
+  ],
+  "domain": [],
+  "minimum_overall_experience_years": null,
+  "required_bandwidth_percentage": null,
+  "project_criticality": null,
+  "project_duration_months": null,
+  "confidence_notes": []
+}}
+
+Text:
+\"\"\"{text}\"\"\"
+"""
+*****************************************************************************************
+schema.py
+--------------------
+# schema.py
+# ---------------------------------------------------------------------------
+# Pydantic models used to validate the structured JSON returned by the LLM.
+# Any change here must be mirrored in prompt.py (JSON template) so the LLM
+# returns matching keys, and in app.py if you want to display the new field.
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel
+from typing import List, Optional
+
+
+class MandatorySkill(BaseModel):
+    """Represents a skill that is required for the project."""
+    skill: str                              # e.g. "Python", "AWS"
+    category: str                           # human-readable label: Programming, AI/ML, Cloud, etc.
+    min_experience_years: Optional[float]   # minimum years of experience; null if not stated
+
+
+class OptionalSkill(BaseModel):
+    """Represents a nice-to-have skill for the project."""
+    skill: str                              # e.g. "Docker", "GraphQL"
+    category: str                           # human-readable label: Programming, AI/ML, Cloud, etc.
+
+
+class ProjectExtraction(BaseModel):
+    """
+    Top-level schema for the extracted project metadata.
+    Every field that cannot be reliably inferred should be null.
+    """
+    project_description: str                            # brief summary of the project
+    mandatory_skills: List[MandatorySkill]               # skills explicitly required
+    optional_skills: List[OptionalSkill]                 # skills listed as optional / nice-to-have
+    domain: List[str]                                    # business domains (e.g. "Finance", "Healthcare")
+    minimum_overall_experience_years: Optional[float]    # overall experience asked for
+    required_bandwidth_percentage: Optional[int]         # e.g. 50 means 50 % allocation
+    project_criticality: Optional[str]                   # HIGH / MEDIUM / LOW / null
+    project_duration_months: Optional[int] = None        # estimated project duration in months
+    confidence_notes: List[str]                          # notes on extraction confidence / caveats
+	
+******************************************************************************************************************
+
+skill_mapping_backend.py
+----------------------------
+
+"""
+skill_mapping_backend.py
+========================
+Reusable backend module for the Skill Mapping pipeline.
+
+This module is framework-agnostic — it contains NO Streamlit or FastAPI
+imports. Any frontend (React, Streamlit, CLI) can call these functions.
+
+Dependent Modules (already in workspace):
+    llm_client.py      — LLM metadata extraction (uses prompt.py + schema.py)
+    prompt.py          — Extraction prompt template
+    schema.py          — Pydantic validation models for extracted metadata
+
+Pipeline Steps:
+    1. Load employee data (Excel / CSV / pickle)
+    2. Flatten employee profiles for embedding
+    3. Generate embeddings via API
+    4. Build & manage FAISS indexes
+    5. Extract requirement metadata via LLM  (delegates to llm_client.py)
+    6. Flatten requirement for embedding (aligned with employee format)
+    7. FAISS semantic search
+    8. Rule-based hybrid scoring
+    9. Final ranking (embedding similarity + rule score)
+   10. LLM-powered explanation for top matches
+"""
+
+import os
+import json
+import asyncio
+import logging
+import sqlite3
+import time
+import threading
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
+
+import numpy as np
+import pandas as pd
+import faiss
+import requests
+from dotenv import load_dotenv
+
+# ── Existing workspace modules ──────────────────────────────────────────────
+from llm_client import extract_project_metadata    # LLM metadata extraction (prompt.py + schema.py)
+
+# ── Load environment variables (.env) ───────────────────────────────────────
+load_dotenv()
+
+# Embedding API config (from .env)
+EMBED_API_URL = os.getenv("EMBED_API_URL")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "text-embedding-3-large")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "3072"))
+EMBED_APPLICATION_TYPE = os.getenv("EMBED_APPLICATION_TYPE", "Developer")
+EMBED_API_KEY = os.getenv("EMBED_API_KEY", "")
+
+# Local embedding model config (from .env)
+LOCAL_EMBED_MODEL_PATH = os.getenv("LOCAL_EMBED_MODEL_PATH", "all-MiniLM-L6-v2")
+LOCAL_EMBED_DIM = int(os.getenv("LOCAL_EMBED_DIM", "384"))
+
+# Lazy-loaded local model instance (loaded once on first use)
+_local_model = None
+_local_model_lock = threading.Lock()
+
+# LLM model params (from .env) — endpoint
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "20000"))
+
+
+# Data paths (from .env)
+DB_PATH = os.getenv("DB_PATH", "enterprise_employee.db")
+INDEX_DIR = os.getenv("INDEX_DIR", "faiss_indexes")
+EMPLOYEE_DATA_PATH = os.getenv("EMPLOYEE_DATA_PATH", "employee_data.pkl")
+
+os.makedirs(INDEX_DIR, exist_ok=True)
+
+
+def get_embed_dim(embedding_model: str = "text-embedding-3-large") -> int:
+    """Return the embedding dimension for the given model."""
+    if embedding_model == "all-MiniLM-L6-v2":
+        return LOCAL_EMBED_DIM
+    return EMBED_DIM
+
+
+def _load_local_model():
+    """
+    Lazy-load the local sentence-transformers model (all-MiniLM-L6-v2).
+    Thread-safe — the model is loaded exactly once.
+    """
+    global _local_model
+    with _local_model_lock:
+        if _local_model is None:
+            from sentence_transformers import SentenceTransformer
+            logging.info(f"[EMBED-LOCAL] Loading local model from '{LOCAL_EMBED_MODEL_PATH}'...")
+            _local_model = SentenceTransformer(LOCAL_EMBED_MODEL_PATH)
+            logging.info(f"[EMBED-LOCAL] Model loaded. Dimension: {_local_model.get_sentence_embedding_dimension()}")
+        return _local_model
+
+logging.basicConfig(
+    filename="enterprise_audit.log",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+# ── Columns from the uploaded Excel / CSV used to build employee embedding text ──
+# These are the exact columns read from the employee data file and consumed by
+# flatten_employee() to produce the text string sent to the SAIS Embedding API.
+#
+#   Column Name                        Used For
+#   ──────────────────────────────────  ────────────────────────────────────────
+#   domain                              Primary domain of the employee
+#   domain_experience_years              Years of experience in that domain
+#   total_experience_years               Total career experience in years
+#   past_project_execution_summary       Free-text summary of past project work
+#   skill                                Individual skill name (one per row)
+#   skill_category                       Category / grouping of the skill
+#   skill_experience_years               Years of experience with that skill
+#
+# NOTE: Each employee may span multiple rows (one row per skill).  The rows are
+#       grouped by employee_id, then flatten_employee() merges them into a single
+#       text block that is embedded as one vector.
+EMBED_COLUMNS = [
+    "domain",
+    "domain_experience_years",
+    "skill",
+    "skill_category",
+    "skill_experience_years",
+    "total_experience_years",
+    "past_project_execution_summary",
+]
+
+# ── Global embedding progress tracker ──────────────────────────────────────
+# Polled by GET /api/embeddings/progress from the frontend.
+_embedding_progress_lock = threading.Lock()
+embedding_progress: dict = {
+    "running": False,
+    "phase": "idle",           # idle | flattening | embedding | normalizing | saving | done | error
+    "current": 0,              # employees embedded so far
+    "total": 0,                # total employees to embed
+    "current_employee_id": "", # ID of the employee currently being embedded
+    "message": "",             # human-readable status line
+}
+
+def _update_progress(**kwargs):
+    """Thread-safe update of the global embedding_progress dict."""
+    with _embedding_progress_lock:
+        embedding_progress.update(kwargs)
+
+def get_embedding_progress() -> dict:
+    """Return a snapshot of the current embedding progress."""
+    with _embedding_progress_lock:
+        return dict(embedding_progress)
+
+
+# ============================================================================
+# DATABASE INITIALISATION
+# ============================================================================
+
+def init_db() -> None:
+    """
+    Create the SQLite tables if they don't exist.
+
+    Tables:
+        index_registry       — FAISS index metadata (type, params, vector count)
+        audit_logs           — Operational audit trail
+        embedding_registry   — **NEW** Maps employee_id → faiss_id (int64).
+                               Replaces the old employee_ids_order.json file.
+                               Supports delete-detection via the `is_active` flag.
+
+    The embedding_registry table stores:
+        employee_id  TEXT PK  — Business employee identifier (e.g. "EMP001")
+        faiss_id     INTEGER  — Unique int64 ID used inside FAISS IndexIDMap
+        embedded_at  TEXT     — ISO timestamp when embedding was generated
+        is_active    INTEGER  — 1 = present in latest employee file,
+                                0 = was deleted (stale embedding)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS index_registry (
+            index_name        TEXT PRIMARY KEY,
+            index_type        TEXT,
+            nlist             INTEGER,
+            nprobe            INTEGER,
+            m                 INTEGER,
+            ef_search         INTEGER,
+            vector_count      INTEGER,
+            created_at        TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            log_id    TEXT,
+            action    TEXT,
+            details   TEXT,
+            timestamp TEXT
+        )
+    """)
+    # ── NEW: Embedding registry (replaces employee_ids_order.json) ──────────
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS embedding_registry (
+            employee_id   TEXT    PRIMARY KEY,
+            faiss_id      INTEGER UNIQUE NOT NULL,
+            embedded_at   TEXT    NOT NULL,
+            is_active     INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ============================================================================
+# EMBEDDING REGISTRY HELPERS  (SQLite-backed, replaces JSON mapping)
+# ============================================================================
+
+def _emp_id_to_faiss_id(employee_id: str) -> int:
+    """
+    Convert a string employee_id to a deterministic int64 for FAISS IndexIDMap.
+
+    Uses a CRC-based hash trimmed to 63 bits (positive int64) so the same
+    employee_id always maps to the same faiss_id across runs.
+    """
+    import hashlib
+    h = hashlib.sha256(str(employee_id).encode()).hexdigest()
+    return int(h[:15], 16)  # 60-bit positive integer — safe for int64
+
+
+def _get_embedded_ids() -> dict:
+    """
+    Return {employee_id: faiss_id} for all ACTIVE embeddings in the registry.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT employee_id, faiss_id FROM embedding_registry WHERE is_active = 1"
+    ).fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in rows}
+
+
+def _get_all_embedded_ids() -> dict:
+    """
+    Return {employee_id: faiss_id} for ALL embeddings (active + inactive).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT employee_id, faiss_id FROM embedding_registry"
+    ).fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in rows}
+
+
+def _faiss_id_to_emp_id(faiss_id: int) -> Optional[str]:
+    """
+    Reverse-lookup: given a FAISS int64 ID, return the employee_id string.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT employee_id FROM embedding_registry WHERE faiss_id = ? AND is_active = 1",
+        (int(faiss_id),)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+# ============================================================================
+# EMPLOYEE DATA LOADING
+# ============================================================================
+
+def load_employee_data(
+    file_path: Optional[str] = None,
+    file_bytes: Optional[bytes] = None,
+    file_name: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Load employee data from an Excel/CSV file (path or raw bytes).
+
+    Returns a cleaned DataFrame and persists it to EMPLOYEE_DATA_PATH.
+    """
+    if file_bytes is not None:
+        import io
+        if file_name and file_name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(file_bytes))
+        else:
+            xls = pd.ExcelFile(io.BytesIO(file_bytes))
+            sheet = sheet_name or xls.sheet_names[0]
+            df = pd.read_excel(xls, sheet_name=sheet)
+    elif file_path is not None:
+        if file_path.endswith(".csv"):
+            df = pd.read_csv(file_path)
+        else:
+            xls = pd.ExcelFile(file_path)
+            sheet = sheet_name or xls.sheet_names[0]
+            df = pd.read_excel(xls, sheet_name=sheet)
+    elif os.path.exists(EMPLOYEE_DATA_PATH):
+        return pd.read_pickle(EMPLOYEE_DATA_PATH)
+    else:
+        raise FileNotFoundError("No employee data source provided and no persisted data found.")
+
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed", na=False)]
+    df = df.fillna("")
+    df = df.reset_index(drop=True)
+    df.to_pickle(EMPLOYEE_DATA_PATH)
+    return df
+
+
+def get_employee_dataframe() -> pd.DataFrame:
+    """Return persisted employee DataFrame (raises if not available)."""
+    if os.path.exists(EMPLOYEE_DATA_PATH):
+        return pd.read_pickle(EMPLOYEE_DATA_PATH)
+    raise FileNotFoundError("Employee data not loaded yet. Upload data first.")
+
+
+# ============================================================================
+# FLATTEN HELPERS
+# ============================================================================
+
+def flatten_employee(emp_group: pd.DataFrame) -> str:
+    """
+    Flatten all skill rows for one employee into a single text block for embedding.
+
+    Columns consumed from the uploaded employee data (Excel / CSV):
+        • domain                          → "Primary Domain" line
+        • domain_experience_years          → "Domain Experience" line
+        • total_experience_years           → "Total Experience" line
+        • past_project_execution_summary   → "Past Project Summary" line
+        • skill                            → each unique skill bullet
+        • skill_category                   → category label per skill bullet
+        • skill_experience_years           → experience years per skill bullet
+
+    The first four columns are taken from the first row of the group (they are
+    identical across all rows for the same employee).  The last three columns
+    are iterated over all rows to collect every distinct skill entry.
+
+    Output format example:
+        Employee Profile
+        Primary Domain: Capital Markets
+        Domain Experience: 8 years
+        Total Experience: 12 years
+        Past Project Summary: Led migration of …
+        Skills:
+        - Skill: Python | Category: Programming | Experience: 6 years
+        - Skill: SQL    | Category: Database    | Experience: 5 years
+    """
+    first = emp_group.iloc[0]
+
+    seen_skills: set = set()
+    skill_lines: list = []
+    for _, row in emp_group.iterrows():
+        skill_name = str(row.get("skill", "")).strip()
+        if skill_name and skill_name.lower() not in seen_skills:
+            seen_skills.add(skill_name.lower())
+            skill_lines.append(
+                f"- Skill: {skill_name} | Category: {row.get('skill_category', '')} "
+                f"| Experience: {row['skill_experience_years']} years"
+            )
+    skill_text = "\n".join(skill_lines)
+
+    return (
+        f"Employee Profile\n"
+        f"Primary Domain: {first['domain']}\n"
+        f"Domain Experience: {first['domain_experience_years']} years\n"
+        f"Total Experience: {first['total_experience_years']} years\n"
+        f"Past Project Summary: {first.get('past_project_execution_summary', 'N/A')}\n"
+        f"Skills:\n{skill_text}"
+    )
+
+
+def flatten_requirement_for_embedding(extracted: dict) -> str:
+    """
+    Flatten LLM-extracted requirement JSON into employee-aligned text
+    so both vectors live in the same semantic space.
+
+    ── FORMAT ALIGNMENT (CRITICAL) ──────────────────────────────────────
+    Skill lines mirror flatten_employee() but adapt to what the user
+    actually specified:
+
+      • Mandatory skill WITH per-skill experience stated:
+            - Skill: Python | Category: Programming | Experience: 5 years
+
+      • Mandatory skill WITHOUT per-skill experience:
+            - Skill: Python | Category: Programming
+
+      • Optional skill:
+            - Skill: E-commerce | Category: DOMAIN | Optional
+
+    The overall minimum_overall_experience_years is used ONLY in the
+    "Domain Experience" and "Total Experience" header lines — it is
+    NOT injected into individual skill lines when the user did not
+    specify per-skill experience.
+    ─────────────────────────────────────────────────────────────────────
+    """
+    domain = ", ".join(extracted.get("domain", [])) or "N/A"
+    min_exp = extracted.get("minimum_overall_experience_years") or 0
+    description = extracted.get("project_description", "N/A")
+
+    # ── Build skill lines ──────────────────────────────────────────────────
+    skill_lines: list = []
+
+    for s in extracted.get("mandatory_skills", []):
+        skill_name = s.get("skill", "").strip()
+        category = s.get("category", "").strip() or "General"
+        per_skill_exp = s.get("min_experience_years")
+        # Only include "| Experience: X years" when the user explicitly
+        # mentioned per-skill experience.  If null / 0, omit it entirely.
+        if per_skill_exp:
+            skill_lines.append(
+                f"- Skill: {skill_name} | Category: {category} "
+                f"| Experience: {per_skill_exp} years"
+            )
+        else:
+            skill_lines.append(
+                f"- Skill: {skill_name} | Category: {category}"
+            )
+
+    for s in extracted.get("optional_skills", []):
+        skill_name = s.get("skill", "").strip()
+        category = s.get("category", "").strip() or "General"
+        # Optional skills are tagged with "| Optional" so the embedding
+        # model understands these are nice-to-have, not hard requirements.
+        skill_lines.append(
+            f"- Skill: {skill_name} | Category: {category} | Optional"
+        )
+
+    skill_text = "\n".join(skill_lines) if skill_lines else "None"
+
+    # ── Final text block — mirrors flatten_employee() structure ─────────────
+    return (
+        f"Employee Profile\n"
+        f"Primary Domain: {domain}\n"
+        f"Domain Experience: {min_exp} years\n"
+        f"Total Experience: {min_exp} years\n"
+        f"Past Project Summary: {description}\n"
+        f"Skills:\n{skill_text}"
+    )
+
+
+def flatten_requirement_display(extracted: dict) -> str:
+    """Human-readable display text for a requirement (not for embedding)."""
+
+    def format_skills(skill_list):
+        if not skill_list:
+            return "None"
+        parts = []
+        for s in skill_list:
+            txt = s.get("skill", "")
+            exp = s.get("min_experience_years", "")
+            cat = s.get("category", "")
+            if exp:
+                txt += f" ({exp} years"
+                if cat:
+                    txt += f", {cat}"
+                txt += ")"
+            elif cat:
+                txt += f" ({cat})"
+            parts.append(txt)
+        return ", ".join(parts)
+
+    return (
+        f"Project Description:\n{extracted.get('project_description', '')}\n\n"
+        f"Domain: {', '.join(extracted.get('domain', [])) or 'N/A'}\n"
+        f"Criticality: {extracted.get('project_criticality', 'N/A')}\n"
+        f"Duration: {extracted.get('project_duration_months', 'N/A')} months\n"
+        f"Required Bandwidth: {extracted.get('required_bandwidth_percentage', 'N/A')}%\n"
+        f"Minimum Overall Experience: {extracted.get('minimum_overall_experience_years', 'N/A')} years\n\n"
+        f"Mandatory Skills:\n{format_skills(extracted.get('mandatory_skills', []))}\n\n"
+        f"Optional Skills:\n{format_skills(extracted.get('optional_skills', []))}"
+    ).strip()
+
+
+# ============================================================================
+# EMBEDDING GENERATION
+# ============================================================================
+
+# Last embedding API error — surfaced in progress / result messages
+_last_embed_api_error: str = ""
+
+
+def get_embedding(text: str, max_retries: int = 3) -> Optional[List[float]]:
+    """
+    Generate an embedding vector for a single text string via SAIS API.
+
+    Includes retry logic with exponential back-off:
+        Attempt 1 → immediate
+        Attempt 2 → wait 2 s
+        Attempt 3 → wait 4 s
+
+    On final failure, stores the error detail in _last_embed_api_error
+    so that upstream callers can surface it to the user.
+    """
+    global _last_embed_api_error
+    payload = json.dumps({"model": EMBED_MODEL_NAME, "input": text})
+    headers = {
+        "applicationType": EMBED_APPLICATION_TYPE,
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {EMBED_API_KEY}",
+    }
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(EMBED_API_URL, headers=headers, data=payload, timeout=300)
+
+            if response.status_code == 200:
+                result = response.json().get("result")
+                if not result:
+                    _last_embed_api_error = "API returned 200 but 'result' key is missing from response."
+                    logging.error(f"[EMBED-API] {_last_embed_api_error} | Body: {response.text[:300]}")
+                    return None
+                data = result.get("data")
+                if not data:
+                    _last_embed_api_error = "API returned 200 but 'result.data' is empty."
+                    logging.error(f"[EMBED-API] {_last_embed_api_error} | Body: {response.text[:300]}")
+                    return None
+                return data[0].get("embedding")
+
+            # ── Non-200 status code ──────────────────────────────────────
+            err_body = response.text[:500]
+            _last_embed_api_error = f"HTTP {response.status_code}: {err_body}"
+            logging.error(
+                f"[EMBED-API] Attempt {attempt}/{max_retries} failed — "
+                f"HTTP {response.status_code}: {err_body}"
+            )
+
+            # 401/403 = auth error — token may be expired or malformed
+            if response.status_code in (401, 403):
+                logging.error(
+                    f"[EMBED-API] Auth error (HTTP {response.status_code}). "
+                    f"Check EMBED_API_KEY in .env — it may be expired or malformed."
+                )
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None
+
+            # 429 = rate-limited — wait longer
+            if response.status_code == 429:
+                wait = 2 ** (attempt + 1)
+                logging.warning(f"[EMBED-API] Rate-limited. Waiting {wait}s before retry…")
+                time.sleep(wait)
+                continue
+
+            # 5xx = server error — retry with backoff
+            if response.status_code >= 500:
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None
+
+            # Other 4xx — don't retry
+            return None
+
+        except requests.exceptions.Timeout:
+            _last_embed_api_error = f"Request timed out (attempt {attempt}/{max_retries})"
+            logging.error(f"[EMBED-API] {_last_embed_api_error}")
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+                continue
+            return None
+
+        except requests.exceptions.ConnectionError as e:
+            _last_embed_api_error = f"Connection error: {e}"
+            logging.error(f"[EMBED-API] Attempt {attempt}/{max_retries} — {_last_embed_api_error}")
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+                continue
+            return None
+
+        except Exception as e:
+            _last_embed_api_error = f"Unexpected error: {e}"
+            logging.error(f"[EMBED-API] {_last_embed_api_error}")
+            return None
+
+    return None
+
+
+def get_embeddings_batch(
+    texts: List[str],
+    batch_size: int = 16,
+    progress_callback=None,
+    employee_ids: Optional[List[str]] = None,
+) -> Optional[np.ndarray]:
+    """
+    Generate embeddings for a list of texts. Returns (N, EMBED_DIM) array.
+
+    Args:
+        texts:             List of flattened text strings.
+        batch_size:        (reserved for future batch API support)
+        progress_callback: Optional callable(current_index, total, employee_id)
+                           called after each successful embedding.
+        employee_ids:      Optional parallel list of employee IDs (for logging).
+
+    On failure, sets _last_embed_api_error with the root-cause detail
+    so the caller / UI can display the actual problem.
+    """
+    global _last_embed_api_error
+    all_embeddings = []
+    total = len(texts)
+    for i, text in enumerate(texts):
+        eid = employee_ids[i] if employee_ids else f"record_{i}"
+        emb = get_embedding(text)
+        if emb is None:
+            err = _last_embed_api_error or "Unknown error"
+            logging.error(
+                f"[EMBED-BATCH] Embedding failed for {eid} ({i+1}/{total}) "
+                f"after retries. Last API error: {err}"
+            )
+            _last_embed_api_error = (
+                f"Failed on employee {eid} ({i+1}/{total}). API error: {err}"
+            )
+            return None
+        all_embeddings.append(emb)
+        if progress_callback:
+            progress_callback(i + 1, total, str(eid))
+    return np.array(all_embeddings, dtype="float32")
+
+
+def get_embedding_local(text: str) -> Optional[List[float]]:
+    """
+    Generate an embedding vector for a single text string using the local
+    all-MiniLM-L6-v2 model (sentence-transformers).
+    """
+    try:
+        model = _load_local_model()
+        emb = model.encode(text, normalize_embeddings=True)
+        return emb.tolist()
+    except Exception as e:
+        logging.error(f"[EMBED-LOCAL] Error encoding text: {e}")
+        return None
+
+
+def get_embeddings_batch_local(
+    texts: List[str],
+    batch_size: int = 32,
+    progress_callback=None,
+    employee_ids: Optional[List[str]] = None,
+) -> Optional[np.ndarray]:
+    """
+    Generate embeddings for a list of texts using the local all-MiniLM-L6-v2 model.
+    Returns (N, LOCAL_EMBED_DIM) array.
+
+    Uses sentence-transformers batch encoding for efficiency.
+    Progress callback is called per-batch.
+    """
+    try:
+        model = _load_local_model()
+        total = len(texts)
+        all_embeddings = []
+
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch_texts = texts[start:end]
+            batch_embs = model.encode(batch_texts, normalize_embeddings=True, show_progress_bar=False)
+            all_embeddings.append(batch_embs)
+
+            if progress_callback:
+                eid = employee_ids[end - 1] if employee_ids else f"record_{end - 1}"
+                progress_callback(end, total, str(eid))
+
+        result = np.vstack(all_embeddings).astype("float32")
+        logging.info(f"[EMBED-LOCAL] Encoded {total} texts → shape {result.shape}")
+        return result
+    except Exception as e:
+        logging.error(f"[EMBED-LOCAL] Batch encoding failed: {e}")
+        return None
+
+
+def normalize_embeddings(vectors: np.ndarray) -> np.ndarray:
+    """L2-normalise in-place (required for cosine similarity via inner product)."""
+    faiss.normalize_L2(vectors)
+    return vectors
+
+
+def generate_embeddings_incremental(
+    df: pd.DataFrame,
+    embedding_model: str = "text-embedding-3-large",
+    embeddings_npy_filename: str = "employee_embeddings.npy",
+) -> dict:
+    """
+    Generate / synchronise employee embeddings with the current employee DataFrame.
+
+    This function handles THREE scenarios:
+    ───────────────────────────────────────────────────────────────────────────
+    SCENARIO 1 — FRESH RUN (no embeddings exist yet)
+        • Generates embeddings for ALL employees in the DataFrame.
+        • Saves to the specified .npy file.
+        • Registers every employee_id → faiss_id mapping in SQLite
+          (embedding_registry table).
+
+    SCENARIO 2 — INCREMENTAL APPEND (new employees added to the file)
+        • Compares employee IDs in the DataFrame against the embedding_registry.
+        • Generates embeddings ONLY for employees NOT yet in the registry.
+        • Appends new vectors to the existing .npy file.
+        • Inserts new rows into embedding_registry.
+
+    SCENARIO 3 — DELETE DETECTION (employees removed from the file)
+        • Detects employee IDs that exist in embedding_registry but are
+          MISSING from the current DataFrame.
+        • Marks those rows as is_active = 0 in embedding_registry.
+        • Rebuilds the .npy file containing only ACTIVE embeddings.
+        • ⚠️  After deletions, ALL FAISS indexes must be recreated because
+          the .npy file positions have changed. The function returns
+          `rebuild_indexes_required = True` so the caller can handle this.
+    ───────────────────────────────────────────────────────────────────────────
+
+    Args:
+        df:                     Employee DataFrame (multi-row per employee, grouped by employee_id)
+        embedding_model:        "text-embedding-3-large" (API) or "all-MiniLM-L6-v2" (local)
+        embeddings_npy_filename: Name of the .npy file to save embeddings to
+
+    Returns:
+        dict with keys:
+            status               — "ok" | "error"
+            new_count            — Number of newly embedded employees
+            deleted_count        — Number of employees marked as deleted
+            total_active         — Total active embeddings after this run
+            rebuild_indexes_required — True if indexes must be recreated
+            vectors              — numpy array of all active embeddings (or None)
+    """
+    # Ensure .npy extension
+    if not embeddings_npy_filename.endswith(".npy"):
+        embeddings_npy_filename += ".npy"
+    embeddings_path = embeddings_npy_filename
+    use_local = (embedding_model == "all-MiniLM-L6-v2")
+    logging.info(f"[EMBED] Using model: {embedding_model}, output: {embeddings_path}")
+
+    # ── Step 1: Identify all unique employee IDs in the current DataFrame ────
+    #    The DataFrame has multiple rows per employee (one per skill).
+    #    We group by employee_id to get one profile per employee.
+    #
+    #    IMPORTANT: Use a SORTED list for iteration order — NOT a set.
+    #    pandas groupby().groups.keys() returns sorted keys.  skill_map.py
+    #    iterates them directly (sorted), so the .npy row order is sorted.
+    #    We must do the same here so that employee_ids_order.json matches
+    #    the .npy row order.  Using set() would randomise the iteration
+    #    order and cause create_index() to assign wrong faiss_ids to vectors.
+    grouped = df.groupby("employee_id")
+    current_emp_ids_ordered = sorted(str(eid) for eid in grouped.groups.keys())
+    current_emp_ids = set(current_emp_ids_ordered)   # O(1) membership checks
+    logging.info(f"[EMBED] Current DataFrame has {len(current_emp_ids)} unique employees.")
+
+    # ── Step 2: Load the existing embedding registry from SQLite ─────────────
+    #    Returns {employee_id_str: faiss_id_int} for ALL rows (active + inactive).
+    #    Previously this was stored in employee_ids_order.json — now in SQLite.
+    all_registered = _get_all_embedded_ids()       # all rows (active & inactive)
+    active_registered = _get_embedded_ids()         # only is_active = 1
+    registered_emp_ids = set(all_registered.keys())
+    active_emp_ids = set(active_registered.keys())
+    logging.info(f"[EMBED] Registry has {len(registered_emp_ids)} total, {len(active_emp_ids)} active embeddings.")
+
+    # ── Step 3: Detect DELETED employees ─────────────────────────────────────
+    #    These are employee IDs that were previously embedded (is_active=1) but
+    #    are NO LONGER present in the current DataFrame.
+    #
+    #    Example:
+    #      Registry (active): {EMP001, EMP002, EMP003, EMP004}
+    #      Current DataFrame: {EMP001, EMP002, EMP004, EMP005}
+    #      → Deleted: {EMP003}   (was active, now missing from file)
+    #      → New:     {EMP005}   (in file, not in registry at all)
+    deleted_ids = active_emp_ids - current_emp_ids
+    logging.info(f"[EMBED] Deleted employees detected: {len(deleted_ids)} -> {deleted_ids if len(deleted_ids) <= 10 else '(too many to list)'}")
+    # ── Step 4: Detect NEW employees ─────────────────────────────────────────
+    #    These are employee IDs in the DataFrame that have NEVER been embedded.
+    #    Note: we check against ALL registered (not just active) to avoid
+    #    re-embedding a previously-deleted-then-re-added employee.
+    #    CRITICAL: iterate the SORTED list, NOT the set, so .npy row order
+    #    is deterministic and matches employee_ids_order.json.
+    new_ids = [eid for eid in current_emp_ids_ordered if eid not in registered_emp_ids]
+    logging.info(f"[EMBED] New employees to embed: {len(new_ids)}")
+
+    # ── Step 5: Also detect RE-ACTIVATED employees ───────────────────────────
+    #    These were previously marked is_active=0 (deleted) but have now
+    #    reappeared in the file. We re-activate them without re-embedding.
+    reactivated_ids = set()
+    for eid in current_emp_ids:
+        if eid in registered_emp_ids and eid not in active_emp_ids:
+            reactivated_ids.add(eid)
+    if reactivated_ids:
+        logging.info(f"[EMBED] Re-activated employees (already embedded): {len(reactivated_ids)}")
+
+    # ── Step 6: Check if there's anything to do ──────────────────────────────
+    #    IMPORTANT: If the target .npy file does NOT exist, this is a fresh run
+    #    for this embedding model — we must embed ALL employees even if the
+    #    registry already knows them (from a different model's run).
+    npy_file_missing = not os.path.exists(embeddings_path)
+    if npy_file_missing and not new_ids:
+        # The .npy doesn't exist but registry says everyone is embedded
+        # → this is a different model run. Force full re-generation.
+        logging.info(
+            f"[EMBED] Target file '{embeddings_path}' does not exist but registry "
+            f"has {len(active_emp_ids)} entries. Forcing full generation for this model."
+        )
+        new_ids = list(current_emp_ids_ordered)  # embed ALL employees
+        deleted_ids = set()
+        reactivated_ids = set()
+
+    if not new_ids and not deleted_ids and not reactivated_ids:
+        logging.info("[EMBED] All employee embeddings are up to date. No changes needed.")
+        _update_progress(
+            running=False, phase="done", current=0, total=0,
+            message=f"All {len(active_emp_ids)} embeddings already up to date. No changes needed.",
+        )
+        vectors = np.load(embeddings_path) if os.path.exists(embeddings_path) else None
+        return {
+            "status": "ok",
+            "new_count": 0,
+            "deleted_count": 0,
+            "reactivated_count": 0,
+            "total_active": len(active_emp_ids),
+            "rebuild_indexes_required": False,
+            "vectors": vectors,
+        }
+
+    # ── Step 7: Generate embeddings for NEW employees ────────────────────────
+    #    For each new employee, flatten their multi-row profile into a single
+    #    text block, then call the SAIS embedding API.
+    new_vectors = None
+    new_faiss_ids = []
+    if new_ids:
+        _update_progress(phase="flattening", current=0, total=len(new_ids),
+                         message=f"Flattening {len(new_ids)} employee profiles…")
+        logging.info(f"[EMBED] Flattening {len(new_ids)} employee profiles for embedding...")
+        texts = []
+        for eid in new_ids:
+            emp_group = grouped.get_group(eid)
+            flattened = flatten_employee(emp_group)
+            texts.append(flattened)
+            logging.debug(f"[EMBED]   Employee {eid}: flattened {len(flattened)} chars")
+
+        model_label = "local model" if use_local else "API"
+        logging.info(f"[EMBED] Calling {model_label} for {len(texts)} texts...")
+        _update_progress(phase="embedding", current=0, total=len(texts),
+                         message=f"Embedding 0 / {len(texts)} employees via {model_label}…")
+
+        def _on_embed_progress(current, total, emp_id):
+            _update_progress(
+                current=current, total=total,
+                current_employee_id=emp_id,
+                message=f"Embedding {current} / {total} employees… (current: {emp_id})",
+            )
+
+        if use_local:
+            new_vectors = get_embeddings_batch_local(
+                texts,
+                progress_callback=_on_embed_progress,
+                employee_ids=new_ids,
+            )
+        else:
+            new_vectors = get_embeddings_batch(
+                texts,
+                progress_callback=_on_embed_progress,
+                employee_ids=new_ids,
+            )
+
+        if new_vectors is None:
+            err_detail = _last_embed_api_error or "Unknown embedding error"
+            _update_progress(running=False, phase="error",
+                             message=f"Embedding failed: {err_detail}")
+            logging.error(f"[EMBED] Embedding call failed. Detail: {err_detail}")
+            return {"status": "error", "message": f"Embedding generation failed: {err_detail}"}
+
+        # L2-normalise so FAISS inner-product = cosine similarity
+        # (local model already normalises, but faiss.normalize_L2 is idempotent)
+        logging.info(f"[EMBED] Normalising {new_vectors.shape[0]} new vectors (L2 → unit length)...")
+        new_vectors = normalize_embeddings(new_vectors)
+
+        # Compute deterministic faiss_id for each new employee
+        new_faiss_ids = [_emp_id_to_faiss_id(eid) for eid in new_ids]
+        logging.info(f"[EMBED] Generated {len(new_faiss_ids)} faiss_ids for new employees.")
+
+    # ── Step 8: Update SQLite embedding_registry ─────────────────────────────
+    _update_progress(phase="saving", message="Updating registry & saving embeddings…")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    now_iso = datetime.now().isoformat()
+
+    #  8a. Mark DELETED employees as inactive
+    if deleted_ids:
+        logging.info(f"[EMBED] Marking {len(deleted_ids)} employees as is_active=0 in registry...")
+        for eid in deleted_ids:
+            cursor.execute(
+                "UPDATE embedding_registry SET is_active = 0 WHERE employee_id = ?",
+                (eid,)
+            )
+
+    #  8b. Re-activate previously-deleted employees that reappeared
+    if reactivated_ids:
+        logging.info(f"[EMBED] Re-activating {len(reactivated_ids)} employees in registry...")
+        for eid in reactivated_ids:
+            cursor.execute(
+                "UPDATE embedding_registry SET is_active = 1 WHERE employee_id = ?",
+                (eid,)
+            )
+
+    #  8c. Insert NEW employee → faiss_id mappings
+    if new_ids:
+        logging.info(f"[EMBED] Inserting {len(new_ids)} new rows into embedding_registry...")
+        for eid, fid in zip(new_ids, new_faiss_ids):
+            cursor.execute(
+                "INSERT OR REPLACE INTO embedding_registry (employee_id, faiss_id, embedded_at, is_active) "
+                "VALUES (?, ?, ?, 1)",
+                (eid, fid, now_iso),
+            )
+
+    conn.commit()
+    conn.close()
+    logging.info("[EMBED] SQLite embedding_registry updated.")
+
+    # ── Step 9: Rebuild / Append the .npy embeddings file ────────────────────
+    #
+    #    CASE A — Deletions occurred:
+    #       We must REBUILD the .npy file from scratch using only ACTIVE IDs
+    #       because positional alignment with FAISS indexes is broken.
+    #       → All FAISS indexes must be recreated afterwards.
+    #
+    #    CASE B — Only new employees (no deletions):
+    #       We simply APPEND the new vectors to the existing .npy file.
+    #       → Existing FAISS indexes can use append_to_index().
+    #
+    rebuild_required = bool(deleted_ids) or bool(reactivated_ids)
+
+    # npy_id_order tracks the ACTUAL employee_id order in the .npy file.
+    # This MUST be saved to employee_ids_order.json so that create_index()
+    # can correctly assign faiss_ids to .npy rows.
+    npy_id_order: list = []
+
+    if rebuild_required:
+        # ── REBUILD: Reload all active embeddings ────────────────────────────
+        logging.info("[EMBED] Deletions/reactivations detected → rebuilding .npy from active set...")
+        active_registry = _get_embedded_ids()  # fresh read after updates
+
+        # Collect vectors: existing active + new
+        all_active_vectors = []
+        all_active_faiss_ids = []
+
+        # Load existing .npy if it exists
+        if os.path.exists(embeddings_path):
+            old_vectors = np.load(embeddings_path)
+            # We need to know which positions in old_vectors map to which employee.
+            # Use the old JSON to get position → employee_id mapping.
+            old_ids_path = "employee_ids_order.json"
+            if os.path.exists(old_ids_path):
+                old_id_list = json.load(open(old_ids_path))
+                for pos, eid in enumerate(old_id_list):
+                    if eid in active_registry and pos < old_vectors.shape[0]:
+                        all_active_vectors.append(old_vectors[pos])
+                        all_active_faiss_ids.append(active_registry[eid])
+                        npy_id_order.append(eid)
+            else:
+                # No old JSON — this shouldn't happen in normal flow but handle gracefully
+                logging.warning("[EMBED] No old employee_ids_order.json found during rebuild.")
+
+        # Append new vectors
+        if new_vectors is not None:
+            for i, eid in enumerate(new_ids):
+                all_active_vectors.append(new_vectors[i])
+                all_active_faiss_ids.append(_emp_id_to_faiss_id(eid))
+                npy_id_order.append(eid)
+
+        if all_active_vectors:
+            all_vectors = np.array(all_active_vectors, dtype="float32")
+            np.save(embeddings_path, all_vectors)
+            logging.info(f"[EMBED] Rebuilt .npy with {all_vectors.shape[0]} active vectors.")
+        else:
+            all_vectors = None
+            logging.warning("[EMBED] No active vectors after rebuild.")
+
+    else:
+        # ── APPEND ONLY: No deletions, just add new vectors ─────────────────
+        # Load existing .npy row order from JSON, then append new_ids.
+        if os.path.exists("employee_ids_order.json"):
+            with open("employee_ids_order.json", "r") as f:
+                npy_id_order = json.load(f)
+        else:
+            npy_id_order = []
+
+        if os.path.exists(embeddings_path) and new_vectors is not None:
+            logging.info(f"[EMBED] Appending {new_vectors.shape[0]} new vectors to existing .npy...")
+            existing_vectors = np.load(embeddings_path)
+            all_vectors = np.vstack([existing_vectors, new_vectors])
+            np.save(embeddings_path, all_vectors)
+            npy_id_order.extend(new_ids)  # new rows appended at the end
+            logging.info(f"[EMBED] .npy now has {all_vectors.shape[0]} vectors.")
+        elif new_vectors is not None:
+            logging.info(f"[EMBED] Creating new .npy with {new_vectors.shape[0]} vectors...")
+            all_vectors = new_vectors
+            np.save(embeddings_path, all_vectors)
+            npy_id_order = list(new_ids)  # fresh .npy, order = new_ids order
+        else:
+            all_vectors = np.load(embeddings_path) if os.path.exists(embeddings_path) else None
+
+    # ── Step 10: Save employee_ids_order.json in ACTUAL .npy row order ───────
+    #    CRITICAL: This JSON records which employee_id is at each .npy row
+    #    position. create_index() relies on this to assign the correct
+    #    faiss_id to each vector.  Previously this was saved as sorted()
+    #    which did NOT match the .npy row order — that bug caused wrong
+    #    employee IDs to be returned from FAISS searches.
+    with open("employee_ids_order.json", "w") as f:
+        json.dump(npy_id_order, f)
+    logging.info(f"[EMBED] employee_ids_order.json updated ({len(npy_id_order)} IDs, in .npy row order).")
+
+    # ── Step 11: Summary ─────────────────────────────────────────────────────
+    active_registry = _get_embedded_ids()  # fresh count after all updates
+    total_active = len(active_registry)
+    logging.info(
+        f"[EMBED] DONE — new: {len(new_ids)}, deleted: {len(deleted_ids)}, "
+        f"reactivated: {len(reactivated_ids)}, total_active: {total_active}, "
+        f"rebuild_indexes_required: {rebuild_required}"
+    )
+
+    _update_progress(
+        running=False, phase="done", current=len(new_ids), total=len(new_ids),
+        message=f"Done — {len(new_ids)} new, {len(deleted_ids)} deleted, {total_active} total active.",
+    )
+
+    return {
+        "status": "ok",
+        "new_count": len(new_ids),
+        "deleted_count": len(deleted_ids),
+        "reactivated_count": len(reactivated_ids),
+        "total_active": total_active,
+        "rebuild_indexes_required": rebuild_required,
+        "vectors": all_vectors,
+    }
+
+
+# ============================================================================
+# FAISS INDEX MANAGEMENT
+# ============================================================================
+
+def create_index(
+    index_name: str,
+    index_type: str = "flat",
+    nlist: int = 20,
+    nprobe: int = 10,
+    m: int = 16,
+    ef_search: int = 32,
+    embeddings_npy_filename: str = "employee_embeddings.npy",
+) -> dict:
+    """
+    Create a new FAISS IndexIDMap2 index from the specified embeddings .npy file.
+
+    The base index (flat / ivf / hnsw / ivf_hnsw) is wrapped in
+    faiss.IndexIDMap2 so that each vector is stored with the employee's
+    deterministic faiss_id (from the SQLite embedding_registry).
+
+    Args:
+        embeddings_npy_filename: The .npy file to load vectors from (default: employee_embeddings.npy)
+    """
+    # Ensure .npy extension
+    if not embeddings_npy_filename.endswith(".npy"):
+        embeddings_npy_filename += ".npy"
+
+    # ── Step 1: Validation ───────────────────────────────────────────────
+    index_path = f"{INDEX_DIR}/{index_name}.index"
+    if os.path.exists(index_path):
+        return {"error": "Index already exists. Use append to add new vectors."}
+
+    if not os.path.exists(embeddings_npy_filename):
+        return {"error": f"No embeddings found at '{embeddings_npy_filename}'. Generate embeddings first."}
+
+    # ── Step 2: Load vectors ─────────────────────────────────────────────
+    vectors = np.load(embeddings_npy_filename)
+    embed_dim = vectors.shape[1]
+    logging.info(f"[INDEX] Loaded {vectors.shape[0]} vectors (dim={embed_dim}) from {embeddings_npy_filename}")
+
+    # ── Step 3: Load active faiss_ids from SQLite registry ───────────────
+    active_registry = _get_embedded_ids()          # {employee_id: faiss_id}
+    if len(active_registry) != vectors.shape[0]:
+        logging.warning(
+            f"[INDEX] Vector count ({vectors.shape[0]}) != active registry count "
+            f"({len(active_registry)}). The embeddings file may be out of sync. "
+            f"Using the first {min(vectors.shape[0], len(active_registry))} entries."
+        )
+
+    # Build the faiss_ids array preserving the same order as the legacy
+    # employee_ids_order.json (which matches the .npy row order).
+    if os.path.exists("employee_ids_order.json"):
+        with open("employee_ids_order.json", "r") as f:
+            ordered_emp_ids = json.load(f)
+    else:
+        # Fallback: alphabetical from registry
+        ordered_emp_ids = sorted(active_registry.keys())
+
+    faiss_ids = np.array(
+        [active_registry[eid] for eid in ordered_emp_ids if eid in active_registry],
+        dtype="int64",
+    )
+    # Trim vectors if registry has fewer entries
+    n = min(vectors.shape[0], len(faiss_ids))
+    vectors = vectors[:n]
+    faiss_ids = faiss_ids[:n]
+    logging.info(f"[INDEX] Using {n} vector–ID pairs for index '{index_name}'")
+
+    # ── Step 4: Build the base index ─────────────────────────────────────
+    if index_type == "flat":
+        base_index = faiss.IndexFlatIP(embed_dim)
+    elif index_type == "ivf":
+        quantizer = faiss.IndexFlatIP(embed_dim)
+        base_index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist)
+        base_index.train(vectors)                  # IVF needs training
+        base_index.nprobe = nprobe
+    elif index_type == "hnsw":
+        base_index = faiss.IndexHNSWFlat(embed_dim, m)
+        base_index.hnsw.efSearch = ef_search
+    elif index_type == "ivf_hnsw":
+        quantizer = faiss.IndexHNSWFlat(embed_dim, m)
+        base_index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist)
+        base_index.train(vectors)                  # IVF needs training
+        base_index.nprobe = nprobe
+        base_index.quantizer.hnsw.efSearch = ef_search
+    else:
+        return {"error": f"Invalid index type: {index_type}"}
+
+    # ── Step 5: Wrap in IndexIDMap2 ──────────────────────────────────────
+    # IndexIDMap2 stores the reverse mapping internally so that
+    # faiss.read_index() will reconstruct it fully from disk.
+    index = faiss.IndexIDMap2(base_index)
+    logging.info(f"[INDEX] Base index wrapped in IndexIDMap2 (type={index_type})")
+
+    # ── Step 6: Add vectors with their deterministic faiss_ids ───────────
+    index.add_with_ids(vectors, faiss_ids)
+    logging.info(f"[INDEX] Added {n} vectors with IDs to IndexIDMap2")
+
+    # ── Step 7: Persist & register ───────────────────────────────────────
+    faiss.write_index(index, index_path)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO index_registry VALUES (?,?,?,?,?,?,?,?)",
+        (index_name, index_type, nlist, nprobe, m, ef_search, int(n), datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    logging.info(f"[INDEX] Index '{index_name}' created — {n} vectors, type={index_type}")
+    return {"status": "ok", "index_name": index_name, "vector_count": int(n)}
+
+
+def append_to_index(index_name: str, rebuild: bool = False, embeddings_npy_filename: str = "employee_embeddings.npy") -> dict:
+    """
+    Append new embeddings to an existing FAISS IndexIDMap2 index.
+
+    If `rebuild=True` (set automatically when employees were deleted),
+    the index is deleted and recreated from scratch so that stale
+    vectors are removed.
+    """
+    # Ensure .npy extension
+    if not embeddings_npy_filename.endswith(".npy"):
+        embeddings_npy_filename += ".npy"
+
+    index_path = f"{INDEX_DIR}/{index_name}.index"
+    if not os.path.exists(index_path):
+        return {"error": f"Index '{index_name}' does not exist."}
+    if not os.path.exists(embeddings_npy_filename):
+        return {"error": f"No embeddings found at '{embeddings_npy_filename}'."}
+
+    # ── Rebuild path (employees were deleted → full recreation) ──────────
+    if rebuild:
+        logging.info(f"[INDEX] Rebuild requested for '{index_name}' — recreating from scratch.")
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT index_type, nlist, nprobe, m, ef_search FROM index_registry WHERE index_name=?",
+            (index_name,),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return {"error": f"Index '{index_name}' not in registry."}
+        idx_type, nlist, nprobe, m, ef_search = row
+        # Remove old files so create_index does not complain
+        os.remove(index_path)
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM index_registry WHERE index_name=?", (index_name,))
+        conn.commit()
+        conn.close()
+        return create_index(index_name, idx_type, nlist, nprobe, m, ef_search, embeddings_npy_filename=embeddings_npy_filename)
+
+    # ── Normal append path ───────────────────────────────────────────────
+    index = faiss.read_index(index_path)
+    all_vectors = np.load(embeddings_npy_filename)
+    active_registry = _get_embedded_ids()          # {employee_id: faiss_id}
+
+    # Determine which faiss_ids are already in the index.
+    # IndexIDMap2 stores an id_map we can inspect.
+    existing_ids_in_index = set()
+    if hasattr(index, 'id_map') and index.id_map.size() > 0:
+        existing_ids_in_index = set(
+            int(index.id_map.at(i)) for i in range(index.id_map.size())
+        )
+    else:
+        # Fallback: treat all vectors in the index as existing
+        existing_ids_in_index = set()
+    logging.info(f"[INDEX] Existing IDs in index: {len(existing_ids_in_index)}")
+
+    # Get ordered employee list (matches .npy row order)
+    if os.path.exists("employee_ids_order.json"):
+        with open("employee_ids_order.json", "r") as f:
+            ordered_emp_ids = json.load(f)
+    else:
+        ordered_emp_ids = sorted(active_registry.keys())
+
+    # Find NEW IDs not yet in the index
+    new_indices = []    # row positions in the .npy file
+    new_faiss_ids = []  # corresponding faiss_ids
+    for i, eid in enumerate(ordered_emp_ids):
+        if eid not in active_registry:
+            continue
+        fid = active_registry[eid]
+        if fid not in existing_ids_in_index and i < all_vectors.shape[0]:
+            new_indices.append(i)
+            new_faiss_ids.append(fid)
+
+    if not new_indices:
+        logging.info(f"[INDEX] No new vectors to append to '{index_name}'.")
+        return {"status": "ok", "message": "No new vectors to append.", "total": int(index.ntotal)}
+
+    new_vectors = all_vectors[np.array(new_indices)]
+    new_faiss_ids_arr = np.array(new_faiss_ids, dtype="int64")
+
+    index.add_with_ids(new_vectors, new_faiss_ids_arr)
+    faiss.write_index(index, index_path)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE index_registry SET vector_count=? WHERE index_name=?",
+        (int(index.ntotal), index_name),
+    )
+    conn.commit()
+    conn.close()
+    logging.info(
+        f"[INDEX] Appended {len(new_indices)} vectors to '{index_name}'. "
+        f"Total now: {index.ntotal}"
+    )
+    return {
+        "status": "ok",
+        "appended": len(new_indices),
+        "total": int(index.ntotal),
+    }
+
+
+def delete_index(index_name: str) -> dict:
+    """Delete a FAISS index from disk and registry."""
+    path = f"{INDEX_DIR}/{index_name}.index"
+    if not os.path.exists(path):
+        return {"error": f"Index '{index_name}' not found."}
+    os.remove(path)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM index_registry WHERE index_name=?", (index_name,))
+    conn.commit()
+    conn.close()
+    logging.info(f"Index {index_name} deleted.")
+    return {"status": "ok"}
+
+
+def list_indexes() -> List[str]:
+    """Return names of all registered FAISS indexes."""
+    conn = sqlite3.connect(DB_PATH)
+    names = pd.read_sql("SELECT index_name FROM index_registry", conn)["index_name"].tolist()
+    conn.close()
+    return names
+
+
+def list_npy_files() -> List[str]:
+    """Return names of all .npy embedding files in the workspace directory."""
+    npy_files = [f for f in os.listdir(".") if f.endswith(".npy")]
+    npy_files.sort()
+    return npy_files
+
+
+# ============================================================================
+# LLM CALLS
+# ============================================================================
+# NOTE: extract_project_metadata() is imported from llm_client.py
+#       (which uses prompt.py for the extraction prompt and schema.py
+#       for Pydantic validation). No duplicate here.
+#
+# _llm_chat() below is used ONLY for the reasoning/explanation step.
+# ============================================================================
+
+def _llm_chat(prompt: str) -> str:
+    """
+    Synchronous LLM chat/completions call.
+
+    Model:    LLM_MODEL_NAME from .env  (default: gpt-5.2)
+    """
+    api_key = "XXXX"
+    if not api_key:
+        return "LLM call failed, check the key"
+
+    headers = {
+        "Content-Type": "application/json",
+        "applicationType": "Replace_Accordingly",
+        "Authorization": f"Bearer {api_key}",
+    }
+    data = {
+        "messages": [{"role": "user", "content": prompt}],
+        "model": LLM_MODEL_NAME,
+        "max_tokens": LLM_MAX_TOKENS,
+    }
+    try:
+        resp = requests.post(LLM_ENDPOINT_URL, json=data, headers=headers, timeout=300)
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        return f"LLM call failed (HTTP {resp.status_code}): {resp.text}"
+    except Exception as e:
+        return f"LLM call error: {e}"
+
+
+# ============================================================================
+# HYBRID SCORING
+# ============================================================================
+
+def calculate_score(
+    emp_group: pd.DataFrame,
+    requirement: dict,
+    weights: dict,
+) -> Tuple[float, float]:
+    """
+    Calculate a hybrid match score for an employee against a requirement.
+
+    Returns (hybrid_score 0-100, calibrated 0.0-1.0).
+    """
+    first = emp_group.iloc[0]
+
+    emp_skills = {
+        row["skill"].strip().lower(): row["skill_experience_years"]
+        for _, row in emp_group.iterrows()
+        if row["skill"]
+    }
+
+    mandatory = [s.strip().lower() for s in requirement.get("mandatory_skills", [])]
+
+    # 1. Mandatory skill coverage
+    if mandatory:
+        matched = len(set(emp_skills.keys()) & set(mandatory))
+        mandatory_score = matched / len(mandatory)
+    else:
+        mandatory_score = 1.0
+
+    # 2. Skill experience score
+    skill_scores = []
+    for skill in mandatory:
+        if skill in emp_skills:
+            if "skill_requirements" in requirement and skill in requirement["skill_requirements"]:
+                req_years = requirement["skill_requirements"][skill]
+                ratio = min(emp_skills[skill] / req_years, 1.0) if req_years > 0 else 1.0
+            else:
+                ratio = 1.0
+        else:
+            ratio = 0.0
+        skill_scores.append(ratio)
+    skill_experience_score = sum(skill_scores) / len(skill_scores) if skill_scores else 0
+
+    # 3. Domain score
+    domain_req = requirement.get("domain_experience", 0)
+    domain_score = min(first["domain_experience_years"] / domain_req, 1.0) if domain_req > 0 else 1.0
+
+    # 4. Total experience score
+    exp_score = min(first["total_experience_years"] / 10, 1.0)
+
+    # 5. Weighted technical score
+    technical_score = (
+        weights.get("mandatory", 0.4) * mandatory_score
+        + weights.get("skill_exp", 0.3) * skill_experience_score
+        + weights.get("domain", 0.2) * domain_score
+        + weights.get("experience", 0.1) * exp_score
+    )
+
+    # 6. Availability factor
+    bandwidth = first.get("current_bandwidth_percent", 100)
+    availability_factor = 0.5 + (bandwidth / 200)
+
+    # 7. Final hybrid score
+    final = technical_score * availability_factor * 100
+    calibrated = round(final / 100, 3)
+    return round(final, 2), calibrated
+
+
+def compute_final_rank(embedding_similarity: float, calibrated_rule_score: float) -> float:
+    """Final Rank = 0.6 × Embedding Similarity + 0.4 × Rule Score."""
+    return round(0.6 * embedding_similarity + 0.4 * calibrated_rule_score, 4)
+
+
+# ============================================================================
+# LLM EXPLANATION
+# ============================================================================
+
+async def llm_reason(emp_text: str, req_text: str, score: float) -> str:
+    """Generate an executive-ready LLM explanation for a match."""
+    prompt = f"""You are an Enterprise Workforce Intelligence Advisor.
+
+Evaluate whether the employee should be allocated to the given role.
+Provide a structured, executive-ready analysis.
+
+Employee Profile:
+{emp_text}
+
+Role Requirement:
+{req_text}
+
+Final Match Score (0–1): {score}
+
+Provide the response in the following structured format:
+
+1. Executive Fit Summary (Overall Fit, Deployment Readiness, Risk Level, Confidence)
+2. Competency Alignment Analysis (Technical, Domain, Seniority, Capacity)
+3. Gap & Risk Assessment (Critical Gaps, Development Gaps, Operational Risks)
+4. Deployment Recommendation (Action, Ramp-up Plan, Mitigation, Checkpoints)
+5. Upskilling & Development Plan (Priority Skills, Certifications, 30-60-90 Plan)
+6. Strategic Workforce Value (Growth Potential, Leadership Pipeline, Versatility)
+7. Resource Optimization Insight (Overqualified?, Opportunity Cost, Career Impact)
+"""
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, lambda: _llm_chat(prompt))
+        return result
+    except Exception as e:
+        return f"LLM reasoning error: {e}"
+
+
+# ============================================================================
+# FULL SKILL-MAPPING SEARCH PIPELINE
+# ============================================================================
+
+def skill_mapping_search(
+    requirement_text: str,
+    index_name: str,
+    weights: Optional[dict] = None,
+    top_n: int = 20,
+    explain_top: int = 10,
+    embedding_model: str = "text-embedding-3-large",
+) -> dict:
+    """
+    End-to-end skill-mapping search.
+
+    Args:
+        requirement_text: Raw free-text requirement (project description, JD, etc.)
+        index_name: Name of the FAISS index to search.
+        weights: Scoring weight dict {mandatory, skill_exp, domain, experience}.
+        top_n: Number of top matches to return.
+        explain_top: How many top matches get LLM explanations.
+        embedding_model: "text-embedding-3-large" (API) or "all-MiniLM-L6-v2" (local)
+
+    Returns:
+        dict with keys: extracted_metadata, display_text, embedding_text,
+                        search_latency_sec, results, explanations
+    """
+    if weights is None:
+        weights = {"mandatory": 0.4, "skill_exp": 0.3, "domain": 0.2, "experience": 0.1}
+
+    # 1. Extract metadata via LLM
+    extracted = extract_project_metadata(requirement_text)
+    if "error" in extracted:
+        return {"error": "Requirement extraction failed", "details": extracted}
+
+    # 2. Flatten for display & embedding
+    display_text = flatten_requirement_display(extracted)
+    embedding_text = flatten_requirement_for_embedding(extracted)
+
+    # 3. Generate requirement embedding using the selected model
+    use_local = (embedding_model == "all-MiniLM-L6-v2")
+    if use_local:
+        req_emb = get_embedding_local(embedding_text)
+    else:
+        req_emb = get_embedding(embedding_text)
+    if req_emb is None:
+        return {"error": "Failed to generate embedding for the requirement."}
+    req_vector = normalize_embeddings(np.array([req_emb], dtype="float32"))
+
+    # 4. Build requirement dict for rule-based scoring
+    requirement = {
+        "domain": ", ".join(extracted.get("domain", [])),
+        "domain_experience": extracted.get("minimum_overall_experience_years") or 0,
+        "mandatory_skills": [s.get("skill", "") for s in extracted.get("mandatory_skills", [])],
+    }
+
+    # 5. Load FAISS IndexIDMap2 index
+    # ── The index was built with faiss.IndexIDMap2, so search results
+    #    in I[0] return the deterministic faiss_ids (not positional offsets).
+    #    We reverse-lookup each faiss_id → employee_id via SQLite.
+    index_path = f"{INDEX_DIR}/{index_name}.index"
+    if not os.path.exists(index_path):
+        return {"error": f"Index '{index_name}' not found."}
+    index = faiss.read_index(index_path)
+
+    # Apply search params from registry
+    conn = sqlite3.connect(DB_PATH)
+    registry = pd.read_sql(
+        f"SELECT * FROM index_registry WHERE index_name='{index_name}'", conn
+    )
+    conn.close()
+    if registry.empty:
+        return {"error": f"Index '{index_name}' not in registry."}
+    reg = registry.iloc[0]
+
+    # For IndexIDMap2-wrapped indexes, nprobe / efSearch must be set on
+    # the *underlying* index, not the wrapper.  We access it via index.index
+    # (the base index inside the IDMap wrapper).
+    base = index.index if hasattr(index, "index") else index
+    if reg["index_type"] in ("ivf", "ivf_hnsw"):
+        base.nprobe = reg["nprobe"]
+    if reg["index_type"] == "hnsw":
+        base.hnsw.efSearch = reg["ef_search"]
+    if reg["index_type"] == "ivf_hnsw":
+        base.quantizer.hnsw.efSearch = reg["ef_search"]
+
+    # 6. FAISS search — I[0] now contains faiss_ids (not positional indexes)
+    start = time.time()
+    D, I = index.search(req_vector, min(50, index.ntotal))
+    latency = round(time.time() - start, 3)
+
+    # 7. Load employee data
+    df = get_employee_dataframe()
+    grouped = df.groupby("employee_id")
+
+    # 8. Build results — reverse-lookup faiss_id → employee_id via SQLite
+    results = []
+    seen: set = set()
+    for rank, faiss_id in enumerate(I[0]):
+        if faiss_id < 0:
+            continue  # -1 means "no more results"
+        emp_id = _faiss_id_to_emp_id(int(faiss_id))
+        if emp_id is None:
+            logging.warning(f"[SEARCH] faiss_id {faiss_id} not found in embedding_registry — skipping.")
+            continue
+        if emp_id in seen:
+            continue
+        seen.add(emp_id)
+
+        emp_group = grouped.get_group(emp_id)
+        similarity = float(D[0][rank])
+        rule_score, calibrated_rule = calculate_score(emp_group, requirement, weights)
+        final_rank = compute_final_rank(similarity, calibrated_rule)
+        confidence = "High" if final_rank >= 0.82 else "Medium" if final_rank >= 0.65 else "Low"
+
+        first = emp_group.iloc[0]
+        unique_skills = list(dict.fromkeys(emp_group["skill"].tolist()))
+
+        results.append({
+            "employee_id": str(first["employee_id"]),
+            "employee_name": str(first["employee_name"]),
+            "domain": str(first["domain"]),
+            "total_experience_years": float(first["total_experience_years"]),
+            "current_bandwidth_percent": float(first["current_bandwidth_percent"]),
+            "skills": unique_skills,
+            "similarity": round(similarity, 4),
+            "rule_score": rule_score,
+            "calibrated_rule_score": calibrated_rule,
+            "final_rank": final_rank,
+            "confidence": confidence,
+        })
+
+    results.sort(key=lambda x: x["final_rank"], reverse=True)
+    top_results = results[:top_n]
+
+    # 9. LLM explanations for top N
+    explanations: List[str] = []
+    if explain_top > 0:
+        async def _run_explanations():
+            tasks = []
+            for r in top_results[:explain_top]:
+                emp_group = grouped.get_group(r["employee_id"])
+                emp_text = flatten_employee(emp_group)
+                tasks.append(llm_reason(emp_text, embedding_text, r["final_rank"]))
+            return await asyncio.gather(*tasks)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If called from an already-running async context (like FastAPI)
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    explanations = list(pool.submit(asyncio.run, _run_explanations()).result())
+            else:
+                explanations = asyncio.run(_run_explanations())
+        except RuntimeError:
+            explanations = asyncio.run(_run_explanations())
+
+    # Attach explanations to results
+    for i, expl in enumerate(explanations):
+        if i < len(top_results):
+            top_results[i]["explanation"] = expl
+
+    return {
+        "extracted_metadata": extracted,
+        "display_text": display_text,
+        "embedding_text": embedding_text,
+        "search_latency_sec": latency,
+        "total_matches": len(results),
+        "results": top_results,
+    }
+**************************************************************************************************
+test_ui.html
+----------------------
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Skill Mapping — API Test Dashboard</title>
+  <style>
+    /* ── Reset & Variables ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:        #0f1117;
+      --surface:   #1a1d27;
+      --surface2:  #242736;
+      --border:    #2e3248;
+      --accent:    #6c63ff;
+      --accent-hover: #5a52e0;
+      --success:   #2ecc71;
+      --danger:    #e74c3c;
+      --warn:      #f39c12;
+      --text:      #e4e6f0;
+      --muted:     #8b8fa3;
+      --radius:    10px;
+      --shadow:    0 2px 12px rgba(0,0,0,.35);
+    }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* ── Layout ────────────────────────────────────────────────────────── */
+    .top-bar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky; top: 0; z-index: 50;
+    }
+    .top-bar h1 { font-size: 1.15rem; font-weight: 600; letter-spacing: .3px; }
+    .top-bar h1 span { color: var(--accent); }
+    #health-badge {
+      font-size: .78rem;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-weight: 600;
+    }
+    .healthy   { background: rgba(46,204,113,.15); color: var(--success); }
+    .unhealthy { background: rgba(231,76,60,.15);  color: var(--danger);  }
+
+    .container {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 24px 20px 60px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
+
+    .full-width { grid-column: 1 / -1; }
+
+    /* ── Cards ─────────────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px 24px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 {
+      font-size: .95rem;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: var(--muted);
+      margin-bottom: 16px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .card h2 .icon { font-size: 1.15rem; }
+
+    /* ── Form elements ─────────────────────────────────────────────────── */
+    label {
+      display: block;
+      font-size: .82rem;
+      color: var(--muted);
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+    input[type="text"],
+    input[type="number"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 9px 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: .88rem;
+      font-family: inherit;
+      transition: border-color .2s;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    textarea { resize: vertical; min-height: 120px; }
+
+    input[type="file"] {
+      font-size: .85rem;
+      color: var(--muted);
+    }
+    input[type="file"]::file-selector-button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 7px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin-right: 10px;
+      font-size: .82rem;
+      transition: background .2s;
+    }
+    input[type="file"]::file-selector-button:hover { background: var(--accent-hover); }
+
+    .form-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .form-row > * { flex: 1; min-width: 120px; }
+    .form-group { margin-bottom: 14px; }
+
+    /* ── Buttons ────────────────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 9px 20px;
+      border: none;
+      border-radius: 6px;
+      font-size: .85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .2s, transform .1s;
+      font-family: inherit;
+    }
+    .btn:active { transform: scale(.97); }
+    .btn-primary   { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-success   { background: var(--success); color: #fff; }
+    .btn-success:hover { background: #27ae60; }
+    .btn-danger    { background: var(--danger); color: #fff; }
+    .btn-danger:hover  { background: #c0392b; }
+    .btn-warn      { background: var(--warn); color: #fff; }
+    .btn-warn:hover    { background: #e67e22; }
+    .btn-sm { padding: 5px 12px; font-size: .78rem; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    .btn-group { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+    /* ── Status / Response ─────────────────────────────────────────────── */
+    .status-bar {
+      margin-top: 14px;
+      padding: 10px 14px;
+      background: var(--surface2);
+      border-left: 3px solid var(--border);
+      border-radius: 0 6px 6px 0;
+      font-size: .83rem;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: 'Cascadia Code', 'Consolas', monospace;
+    }
+    .status-bar.ok   { border-left-color: var(--success); }
+    .status-bar.err  { border-left-color: var(--danger); }
+    .status-bar.warn { border-left-color: var(--warn); }
+
+    /* ── Index chips ───────────────────────────────────────────────────── */
+    .chip-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 5px 14px;
+      font-size: .82rem;
+    }
+    .chip .del {
+      background: none;
+      border: none;
+      color: var(--danger);
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+      padding: 0;
+    }
+
+    /* ── Weight sliders ────────────────────────────────────────────────── */
+    .weight-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .weight-row label { width: 110px; flex-shrink: 0; margin: 0; }
+    .weight-row input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent);
+      height: 6px;
+    }
+    .weight-val {
+      width: 38px;
+      text-align: right;
+      font-family: monospace;
+      font-size: .85rem;
+      color: var(--accent);
+    }
+
+    /* ── Results table ─────────────────────────────────────────────────── */
+    .results-wrap { overflow-x: auto; margin-top: 14px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .82rem;
+    }
+    th, td {
+      padding: 9px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: var(--surface2);
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      font-size: .75rem;
+      letter-spacing: .8px;
+      position: sticky; top: 0;
+    }
+    tr:hover td { background: rgba(108,99,255,.06); }
+
+    .conf-high   { color: var(--success); font-weight: 600; }
+    .conf-medium { color: var(--warn);    font-weight: 600; }
+    .conf-low    { color: var(--danger);  font-weight: 600; }
+
+    /* ── Explanation modal ─────────────────────────────────────────────── */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,.6);
+      z-index: 100;
+      justify-content: center;
+      align-items: center;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      width: 90%;
+      max-width: 720px;
+      max-height: 80vh;
+      overflow-y: auto;
+      padding: 24px 28px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    }
+    .modal h3 { margin-bottom: 14px; font-size: 1rem; }
+    .modal pre {
+      background: var(--surface2);
+      padding: 14px;
+      border-radius: 6px;
+      font-size: .82rem;
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+    .modal .close-btn {
+      float: right;
+      background: none;
+      border: none;
+      color: var(--muted);
+      font-size: 1.3rem;
+      cursor: pointer;
+    }
+
+    /* ── Spinner ────────────────────────────────────────────────────────── */
+    .spinner {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,.2);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Metadata / extracted display ──────────────────────────────────── */
+    .meta-block {
+      background: var(--surface2);
+      border-radius: 6px;
+      padding: 14px;
+      margin-top: 12px;
+      font-size: .83rem;
+      white-space: pre-wrap;
+      max-height: 250px;
+      overflow-y: auto;
+    }
+
+    /* ── Progress bar ──────────────────────────────────────────────────── */
+    .progress-wrap {
+      margin-top: 12px;
+      display: none;
+    }
+    .progress-wrap.active { display: block; }
+    .progress-bar-outer {
+      width: 100%;
+      height: 24px;
+      background: var(--surface2);
+      border-radius: 12px;
+      overflow: hidden;
+      position: relative;
+    }
+    .progress-bar-inner {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #8b7bff);
+      border-radius: 12px;
+      transition: width .4s ease;
+      min-width: 0;
+    }
+    .progress-bar-inner.indeterminate {
+      width: 30% !important;
+      animation: indeterminate 1.5s ease-in-out infinite;
+    }
+    @keyframes indeterminate {
+      0%   { margin-left: 0; }
+      50%  { margin-left: 70%; }
+      100% { margin-left: 0; }
+    }
+    .progress-label {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: .78rem;
+      font-weight: 600;
+      color: #fff;
+      text-shadow: 0 1px 3px rgba(0,0,0,.5);
+      pointer-events: none;
+    }
+    .progress-detail {
+      margin-top: 6px;
+      font-size: .82rem;
+      color: var(--muted);
+      font-family: 'Cascadia Code', 'Consolas', monospace;
+    }
+    .progress-detail .phase-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: .75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      margin-right: 6px;
+    }
+    .phase-flattening { background: rgba(52,152,219,.2); color: #3498db; }
+    .phase-embedding  { background: rgba(108,99,255,.2);  color: var(--accent); }
+    .phase-normalizing { background: rgba(155,89,182,.2); color: #9b59b6; }
+    .phase-saving     { background: rgba(243,156,18,.2);  color: var(--warn); }
+    .phase-done       { background: rgba(46,204,113,.2);  color: var(--success); }
+    .phase-error      { background: rgba(231,76,60,.2);   color: var(--danger); }
+    .phase-starting   { background: rgba(149,165,166,.2); color: #95a5a6; }
+    .phase-idle       { background: rgba(149,165,166,.2); color: #95a5a6; }
+
+    /* ── Scrollbar ─────────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--surface); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Index type info ───────────────────────────────────────────────── */
+    .param-info {
+      font-size: .78rem;
+      color: var(--muted);
+      font-style: italic;
+      margin-top: 4px;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- TOP BAR                                                               -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="top-bar">
+  <h1>⚡ <span>Skill Mapping</span> — API Test Dashboard</h1>
+  <div>
+    <span id="health-badge" class="unhealthy">● Checking…</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!-- 1. EMPLOYEE UPLOAD                                                  -->
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <div class="card">
+    <h2><span class="icon">📂</span> 1 — Upload Employee Data</h2>
+    <div class="form-group">
+      <label for="emp-file">Excel / CSV File</label>
+      <input type="file" id="emp-file" accept=".xlsx,.csv" />
+    </div>
+    <div class="form-group">
+      <label for="sheet-name">Sheet Name (optional, for .xlsx)</label>
+      <input type="text" id="sheet-name" placeholder="e.g. Sheet1" />
+    </div>
+    <button class="btn btn-primary" id="btn-upload" onclick="uploadEmployees()">
+      Upload
+    </button>
+    <div class="status-bar" id="upload-status">Waiting for file…</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!-- 2. GENERATE EMBEDDINGS                                              -->
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <div class="card">
+    <h2><span class="icon">🧬</span> 2 — Generate Embeddings</h2>
+    <p style="font-size:.84rem;color:var(--muted);margin-bottom:14px;">
+      Generates embeddings for newly added employees, detects deleted ones,
+      and flags if an index rebuild is needed.
+    </p>
+
+    <div class="form-row">
+      <div>
+        <label for="embed-model">Embedding Model</label>
+        <select id="embed-model">
+          <option value="text-embedding-3-large">text-embedding-3-large (API)</option>
+          <option value="all-MiniLM-L6-v2">all-MiniLM-L6-v2 (Local)</option>
+        </select>
+      </div>
+      <div>
+        <label for="embed-npy-name">Output .npy Filename</label>
+        <input type="text" id="embed-npy-name" placeholder="e.g. employee_embeddings.npy" value="employee_embeddings.npy" />
+        <div class="param-info">Name of the .npy file to save embeddings to</div>
+      </div>
+    </div>
+
+    <button class="btn btn-success" id="btn-embed" onclick="generateEmbeddings()">
+      Generate Embeddings
+    </button>
+
+    <!-- Progress bar -->
+    <div class="progress-wrap" id="embed-progress-wrap">
+      <div class="progress-bar-outer">
+        <div class="progress-bar-inner" id="embed-progress-bar" style="width:0%"></div>
+        <div class="progress-label" id="embed-progress-label">0 / 0</div>
+      </div>
+      <div class="progress-detail" id="embed-progress-detail"></div>
+    </div>
+
+    <div class="status-bar" id="embed-status">No embeddings generated yet.</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!-- 3. INDEX MANAGEMENT                                                 -->
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <div class="card full-width">
+    <h2><span class="icon">🗂️</span> 3 — FAISS Index Management</h2>
+
+    <div class="form-row">
+      <div>
+        <label for="idx-name">Index Name</label>
+        <input type="text" id="idx-name" placeholder="e.g. prod_flat_v1" />
+      </div>
+      <div>
+        <label for="idx-type">Index Type</label>
+        <select id="idx-type" onchange="toggleIndexParams()">
+          <option value="flat">Flat (Exact, brute-force)</option>
+          <option value="ivf">IVF (Inverted File)</option>
+          <option value="hnsw">HNSW (Graph-based)</option>
+          <option value="ivf_hnsw">IVF + HNSW (Hybrid)</option>
+        </select>
+      </div>
+      <div>
+        <label for="idx-npy-file">Embeddings .npy File</label>
+        <select id="idx-npy-file">
+          <option value="employee_embeddings.npy">employee_embeddings.npy</option>
+        </select>
+        <div class="param-info">
+          <button class="btn btn-sm" style="padding:2px 8px;font-size:.72rem;background:var(--surface2);color:var(--muted);border:1px solid var(--border);" onclick="refreshNpyFiles()">⟳ Refresh .npy files</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- IVF params -->
+    <div class="form-row" id="ivf-params">
+      <div>
+        <label for="idx-nlist">nlist (IVF clusters)</label>
+        <input type="number" id="idx-nlist" value="20" min="1" />
+        <div class="param-info">Number of Voronoi cells for IVF</div>
+      </div>
+      <div>
+        <label for="idx-nprobe">nprobe (search depth)</label>
+        <input type="number" id="idx-nprobe" value="10" min="1" />
+        <div class="param-info">How many cells to visit during search</div>
+      </div>
+    </div>
+
+    <!-- HNSW params -->
+    <div class="form-row" id="hnsw-params">
+      <div>
+        <label for="idx-m">M (HNSW links)</label>
+        <input type="number" id="idx-m" value="16" min="4" />
+        <div class="param-info">Number of bi-directional links per node</div>
+      </div>
+      <div>
+        <label for="idx-ef">efSearch (HNSW depth)</label>
+        <input type="number" id="idx-ef" value="32" min="1" />
+        <div class="param-info">Search depth in the graph</div>
+      </div>
+    </div>
+
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="createIndex()">Create Index</button>
+      <button class="btn btn-success" onclick="refreshIndexes()">⟳ Refresh List</button>
+    </div>
+    <div class="status-bar" id="index-status">No indexes yet.</div>
+
+    <h2 style="margin-top:20px;"><span class="icon">📋</span> Available Indexes</h2>
+    <div class="chip-list" id="index-chips">
+      <span style="color:var(--muted);font-size:.84rem;">Click "Refresh List" to load.</span>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!-- 4. SKILL MAPPING SEARCH                                             -->
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <div class="card full-width">
+    <h2><span class="icon">🔍</span> 4 — Skill Mapping Search</h2>
+
+    <div class="form-row">
+      <div style="flex:2;">
+        <label for="search-index">Select Index</label>
+        <select id="search-index">
+          <option value="">— load indexes first —</option>
+        </select>
+      </div>
+      <div>
+        <label for="search-embed-model">Embedding Model</label>
+        <select id="search-embed-model">
+          <option value="text-embedding-3-large">text-embedding-3-large (API)</option>
+          <option value="all-MiniLM-L6-v2">all-MiniLM-L6-v2 (Local)</option>
+        </select>
+        <div class="param-info">Must match model used when creating the index</div>
+      </div>
+      <div>
+        <label for="search-topn">Top N</label>
+        <input type="number" id="search-topn" value="20" min="1" max="100" />
+      </div>
+      <div>
+        <label for="search-explain">Explain Top</label>
+        <input type="number" id="search-explain" value="5" min="0" max="50" />
+      </div>
+    </div>
+
+    <!-- Input mode tabs -->
+    <div class="btn-group" style="margin-bottom:14px;">
+      <button class="btn btn-sm btn-primary" id="tab-text" onclick="setSearchMode('text')">✏️ Paste Text</button>
+      <button class="btn btn-sm" id="tab-file" onclick="setSearchMode('file')" style="background:var(--surface2);color:var(--text);">📎 Upload .txt File</button>
+    </div>
+
+    <div id="search-text-input">
+      <label for="req-text">Requirement / Job Description</label>
+      <textarea id="req-text" rows="6" placeholder="Paste the full project requirement or job description here…"></textarea>
+    </div>
+
+    <div id="search-file-input" class="hidden">
+      <label for="req-file">Requirement File (.txt)</label>
+      <input type="file" id="req-file" accept=".txt" />
+    </div>
+
+    <!-- Weight sliders -->
+    <details style="margin-top:14px;" open>
+      <summary style="cursor:pointer;font-size:.88rem;font-weight:600;color:var(--muted);">
+        ⚖️ Scoring Weights
+      </summary>
+      <div style="margin-top:10px;">
+        <div class="weight-row">
+          <label>Mandatory Skills</label>
+          <input type="range" id="w-mandatory" min="0" max="1" step="0.05" value="0.4" oninput="updateWeight(this)" />
+          <span class="weight-val" id="w-mandatory-val">0.40</span>
+        </div>
+        <div class="weight-row">
+          <label>Skill Experience</label>
+          <input type="range" id="w-skill-exp" min="0" max="1" step="0.05" value="0.3" oninput="updateWeight(this)" />
+          <span class="weight-val" id="w-skill-exp-val">0.30</span>
+        </div>
+        <div class="weight-row">
+          <label>Domain</label>
+          <input type="range" id="w-domain" min="0" max="1" step="0.05" value="0.2" oninput="updateWeight(this)" />
+          <span class="weight-val" id="w-domain-val">0.20</span>
+        </div>
+        <div class="weight-row">
+          <label>Experience</label>
+          <input type="range" id="w-experience" min="0" max="1" step="0.05" value="0.1" oninput="updateWeight(this)" />
+          <span class="weight-val" id="w-experience-val">0.10</span>
+        </div>
+        <div style="font-size:.8rem;color:var(--muted);margin-top:4px;">
+          Total: <strong id="w-total" style="color:var(--success);">1.00</strong>
+        </div>
+      </div>
+    </details>
+
+    <div class="btn-group" style="margin-top:14px;">
+      <button class="btn btn-primary" id="btn-search" onclick="runSearch()">
+        🚀 Search
+      </button>
+    </div>
+
+    <div class="status-bar" id="search-status">Ready to search.</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!-- 5. SEARCH RESULTS                                                   -->
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <div class="card full-width" id="results-card" style="display:none;">
+    <h2><span class="icon">📊</span> Search Results</h2>
+
+    <div class="form-row">
+      <div>
+        <strong style="font-size:.85rem;color:var(--muted);">Search Latency:</strong>
+        <span id="res-latency">—</span>
+      </div>
+      <div>
+        <strong style="font-size:.85rem;color:var(--muted);">Total Matches:</strong>
+        <span id="res-total">—</span>
+      </div>
+    </div>
+
+    <details style="margin-bottom:12px;">
+      <summary style="cursor:pointer;font-size:.85rem;color:var(--muted);font-weight:600;">
+        📑 Extracted Requirement Metadata
+      </summary>
+      <div class="meta-block" id="res-metadata">—</div>
+    </details>
+
+    <details style="margin-bottom:12px;">
+      <summary style="cursor:pointer;font-size:.85rem;color:var(--muted);font-weight:600;">
+        📝 Display Text / Embedding Text
+      </summary>
+      <div class="meta-block" id="res-display-text">—</div>
+    </details>
+
+    <div class="results-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Employee ID</th>
+            <th>Name</th>
+            <th>Domain</th>
+            <th>Experience</th>
+            <th>Bandwidth</th>
+            <th>Skills</th>
+            <th>Similarity</th>
+            <th>Rule Score</th>
+            <th>Final Rank</th>
+            <th>Confidence</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody id="results-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- EXPLANATION MODAL                                                     -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <button class="close-btn" onclick="document.getElementById('modal-overlay').classList.remove('active')">✕</button>
+    <h3 id="modal-title">Employee Details</h3>
+    <pre id="modal-body"></pre>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- JAVASCRIPT                                                            -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<script>
+const API = "http://localhost:8000";
+let searchMode = "text";          // "text" | "file"
+let lastResults = [];             // cache for modal lookups
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+function setStatus(id, text, level = "") {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = "status-bar " + level;
+}
+
+function setBtnLoading(btn, loading) {
+  if (loading) {
+    btn.disabled = true;
+    btn.dataset.orig = btn.innerHTML;
+    btn.innerHTML = '<span class="spinner"></span> Working…';
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = btn.dataset.orig || btn.innerHTML;
+  }
+}
+
+async function apiFetch(path, opts = {}) {
+  const res = await fetch(API + path, opts);
+  const json = await res.json();
+  if (!res.ok) {
+    const msg = json.detail || json.error || JSON.stringify(json);
+    throw new Error(`HTTP ${res.status}: ${msg}`);
+  }
+  return json;
+}
+
+// ── Health Check ─────────────────────────────────────────────────────────
+
+async function checkHealth() {
+  const badge = document.getElementById("health-badge");
+  try {
+    const data = await apiFetch("/api/health");
+    badge.textContent = "● API Online";
+    badge.className = "healthy";
+  } catch {
+    badge.textContent = "● API Offline";
+    badge.className = "unhealthy";
+  }
+}
+checkHealth();
+setInterval(checkHealth, 15000);
+
+// ── 1. Upload Employees ──────────────────────────────────────────────────
+
+async function uploadEmployees() {
+  const btn = document.getElementById("btn-upload");
+  const fileInput = document.getElementById("emp-file");
+  const sheet = document.getElementById("sheet-name").value.trim();
+
+  if (!fileInput.files.length) {
+    setStatus("upload-status", "⚠ Please select a file first.", "warn");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("file", fileInput.files[0]);
+  if (sheet) formData.append("sheet_name", sheet);
+
+  setBtnLoading(btn, true);
+  setStatus("upload-status", "Uploading…", "");
+  try {
+    const data = await apiFetch("/api/employees/upload", {
+      method: "POST",
+      body: formData,
+    });
+    setStatus("upload-status",
+      `✔ Upload successful — ${data.rows_loaded} rows loaded.`, "ok");
+  } catch (e) {
+    setStatus("upload-status", `✖ ${e.message}`, "err");
+  } finally {
+    setBtnLoading(btn, false);
+  }
+}
+
+// ── 2. Generate Embeddings (background + polling) ────────────────────────
+
+let embedPollTimer = null;
+
+function showProgress(show) {
+  document.getElementById("embed-progress-wrap").classList.toggle("active", show);
+}
+
+function updateProgressUI(p) {
+  const bar = document.getElementById("embed-progress-bar");
+  const label = document.getElementById("embed-progress-label");
+  const detail = document.getElementById("embed-progress-detail");
+
+  const pct = p.total > 0 ? Math.round((p.current / p.total) * 100) : 0;
+
+  // If we're in a phase with no countable progress, show indeterminate
+  if (p.phase === "starting" || p.phase === "saving" || (p.phase === "flattening" && p.total === 0)) {
+    bar.classList.add("indeterminate");
+    bar.style.width = "";
+    label.textContent = p.phase === "saving" ? "Saving…" : "Starting…";
+  } else {
+    bar.classList.remove("indeterminate");
+    bar.style.width = pct + "%";
+    label.textContent = p.total > 0 ? `${p.current} / ${p.total}  (${pct}%)` : p.phase;
+  }
+
+  // Phase badge + message
+  const phaseClass = `phase-${p.phase}`;
+  detail.innerHTML = `<span class="phase-badge ${phaseClass}">${p.phase}</span> ${escapeHtml(p.message || "")}`;
+
+  // Also mirror into the status bar during running
+  if (p.running) {
+    setStatus("embed-status", p.message || `Phase: ${p.phase}`, "");
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function pollEmbeddingProgress() {
+  try {
+    const p = await apiFetch("/api/embeddings/progress");
+    updateProgressUI(p);
+
+    if (!p.running) {
+      // Done or error — stop polling
+      clearInterval(embedPollTimer);
+      embedPollTimer = null;
+
+      // Fetch the final result
+      try {
+        const result = await apiFetch("/api/embeddings/result");
+        if (result.status === "ok") {
+          const lines = [
+            `✔ Embeddings updated`,
+            `   New:          ${result.new_count ?? "—"}`,
+            `   Deleted:      ${result.deleted_count ?? "—"}`,
+            `   Reactivated:  ${result.reactivated_count ?? "—"}`,
+            `   Total Active: ${result.total_active ?? "—"}`,
+          ];
+          if (result.rebuild_indexes_required) {
+            lines.push(`   ⚠ Rebuild indexes required! Use append with rebuild=true.`);
+          }
+          setStatus("embed-status", lines.join("\n"), result.rebuild_indexes_required ? "warn" : "ok");
+        } else if (result.status === "error") {
+          setStatus("embed-status", `✖ ${result.message || "Generation failed."}`, "err");
+        } else {
+          setStatus("embed-status", p.message || "Completed.", p.phase === "error" ? "err" : "ok");
+        }
+      } catch {
+        setStatus("embed-status", p.message || "Completed.", p.phase === "error" ? "err" : "ok");
+      }
+
+      setBtnLoading(document.getElementById("btn-embed"), false);
+      // Refresh .npy files dropdown after generation completes
+      refreshNpyFiles();
+      // Keep progress bar visible for a moment, then hide
+      setTimeout(() => { if (!embedPollTimer) showProgress(false); }, 5000);
+    }
+  } catch (e) {
+    // Network error during poll — keep trying
+    console.warn("Progress poll error:", e.message);
+  }
+}
+
+async function generateEmbeddings() {
+  const btn = document.getElementById("btn-embed");
+  const embedModel = document.getElementById("embed-model").value;
+  let npyName = document.getElementById("embed-npy-name").value.trim() || "employee_embeddings.npy";
+  if (!npyName.endsWith(".npy")) npyName += ".npy";
+
+  // If already polling, don't kick off again
+  if (embedPollTimer) {
+    setStatus("embed-status", "⚠ Generation is already running. Please wait.", "warn");
+    return;
+  }
+
+  setBtnLoading(btn, true);
+  showProgress(true);
+  updateProgressUI({ running: true, phase: "starting", current: 0, total: 0, message: `Sending request (${embedModel})…` });
+  setStatus("embed-status", `Sending request (${embedModel})…`, "");
+
+  try {
+    const params = new URLSearchParams({
+      embedding_model: embedModel,
+      embeddings_npy_filename: npyName,
+    });
+    const data = await apiFetch(`/api/embeddings/generate?${params}`, { method: "POST" });
+
+    if (data.status === "already_running") {
+      setStatus("embed-status", "⚠ Already running — attaching to progress…", "warn");
+    }
+
+    // Start polling every 1s
+    embedPollTimer = setInterval(pollEmbeddingProgress, 1000);
+    // Also do one immediate poll
+    pollEmbeddingProgress();
+
+  } catch (e) {
+    setStatus("embed-status", `✖ ${e.message}`, "err");
+    setBtnLoading(btn, false);
+    showProgress(false);
+  }
+}
+
+// ── 3. Index Management ──────────────────────────────────────────────────
+
+// Refresh .npy files dropdown
+async function refreshNpyFiles() {
+  try {
+    const data = await apiFetch("/api/embeddings/npy-files");
+    const list = data.npy_files || [];
+    const select = document.getElementById("idx-npy-file");
+    if (!list.length) {
+      select.innerHTML = '<option value="">— no .npy files found —</option>';
+    } else {
+      select.innerHTML = list.map(f => `<option value="${f}">${f}</option>`).join("");
+    }
+  } catch (e) {
+    console.warn("Failed to refresh .npy files:", e.message);
+  }
+}
+// Auto-refresh on page load
+refreshNpyFiles();
+
+// Auto-suggest .npy filename when embedding model changes
+document.getElementById("embed-model").addEventListener("change", function() {
+  const npyInput = document.getElementById("embed-npy-name");
+  if (this.value === "all-MiniLM-L6-v2") {
+    npyInput.value = "employee_embeddings_local.npy";
+  } else {
+    npyInput.value = "employee_embeddings.npy";
+  }
+});
+
+function toggleIndexParams() {
+  const t = document.getElementById("idx-type").value;
+  const ivf = document.getElementById("ivf-params");
+  const hnsw = document.getElementById("hnsw-params");
+  ivf.classList.toggle("hidden", !["ivf", "ivf_hnsw"].includes(t));
+  hnsw.classList.toggle("hidden", !["hnsw", "ivf_hnsw"].includes(t));
+}
+toggleIndexParams();
+
+async function createIndex() {
+  const name = document.getElementById("idx-name").value.trim();
+  if (!name) { setStatus("index-status", "⚠ Enter an index name.", "warn"); return; }
+
+  const npyFile = document.getElementById("idx-npy-file").value;
+
+  const body = {
+    index_name: name,
+    index_type: document.getElementById("idx-type").value,
+    nlist:     parseInt(document.getElementById("idx-nlist").value) || 20,
+    nprobe:    parseInt(document.getElementById("idx-nprobe").value) || 10,
+    m:         parseInt(document.getElementById("idx-m").value) || 16,
+    ef_search: parseInt(document.getElementById("idx-ef").value) || 32,
+    embeddings_npy_filename: npyFile,
+  };
+
+  setStatus("index-status", `Creating index "${name}"…`, "");
+  try {
+    const data = await apiFetch("/api/indexes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    setStatus("index-status",
+      `✔ Index "${data.index_name}" created — ${data.vector_count} vectors.`, "ok");
+    refreshIndexes();
+  } catch (e) {
+    setStatus("index-status", `✖ ${e.message}`, "err");
+  }
+}
+
+async function refreshIndexes() {
+  try {
+    const data = await apiFetch("/api/indexes");
+    const list = data.indexes || [];
+    const chips = document.getElementById("index-chips");
+    const select = document.getElementById("search-index");
+
+    // Chips
+    if (!list.length) {
+      chips.innerHTML = '<span style="color:var(--muted);font-size:.84rem;">No indexes found.</span>';
+    } else {
+      chips.innerHTML = list.map(n => `
+        <span class="chip">
+          🗂️ ${n}
+          <button class="btn btn-sm btn-success" onclick="appendIndex('${n}', false)" title="Append new vectors">+Append</button>
+          <button class="btn btn-sm btn-warn" onclick="appendIndex('${n}', true)" title="Full rebuild (after deletions)">⟳Rebuild</button>
+          <button class="del" onclick="deleteIndex('${n}')" title="Delete index">✕</button>
+        </span>
+      `).join("");
+    }
+
+    // Dropdown
+    select.innerHTML = list.length
+      ? list.map(n => `<option value="${n}">${n}</option>`).join("")
+      : '<option value="">— no indexes —</option>';
+
+  } catch (e) {
+    document.getElementById("index-chips").innerHTML =
+      `<span style="color:var(--danger);font-size:.84rem;">Error: ${e.message}</span>`;
+  }
+}
+
+async function appendIndex(name, rebuild) {
+  const q = rebuild ? "?rebuild=true" : "";
+  setStatus("index-status", `${rebuild ? "Rebuilding" : "Appending to"} "${name}"…`, "");
+  try {
+    const data = await apiFetch(`/api/indexes/${name}/append${q}`, { method: "POST" });
+    const msg = data.message
+      ? `✔ ${data.message}`
+      : `✔ ${rebuild ? "Rebuilt" : "Appended"} — ${data.appended ?? data.vector_count ?? "?"} vectors. Total: ${data.total ?? data.vector_count ?? "?"}`;
+    setStatus("index-status", msg, "ok");
+    refreshIndexes();
+  } catch (e) {
+    setStatus("index-status", `✖ ${e.message}`, "err");
+  }
+}
+
+async function deleteIndex(name) {
+  if (!confirm(`Delete index "${name}"?`)) return;
+  setStatus("index-status", `Deleting "${name}"…`, "");
+  try {
+    await apiFetch(`/api/indexes/${name}`, { method: "DELETE" });
+    setStatus("index-status", `✔ Index "${name}" deleted.`, "ok");
+    refreshIndexes();
+  } catch (e) {
+    setStatus("index-status", `✖ ${e.message}`, "err");
+  }
+}
+
+// ── 4. Search ────────────────────────────────────────────────────────────
+
+function setSearchMode(mode) {
+  searchMode = mode;
+  document.getElementById("search-text-input").classList.toggle("hidden", mode !== "text");
+  document.getElementById("search-file-input").classList.toggle("hidden", mode !== "file");
+  document.getElementById("tab-text").className  = mode === "text" ? "btn btn-sm btn-primary" : "btn btn-sm";
+  document.getElementById("tab-file").className  = mode === "file" ? "btn btn-sm btn-primary" : "btn btn-sm";
+  if (mode !== "text") {
+    document.getElementById("tab-text").style = "background:var(--surface2);color:var(--text);";
+    document.getElementById("tab-file").style = "";
+  } else {
+    document.getElementById("tab-file").style = "background:var(--surface2);color:var(--text);";
+    document.getElementById("tab-text").style = "";
+  }
+}
+
+function updateWeight(el) {
+  const val = parseFloat(el.value).toFixed(2);
+  document.getElementById(el.id + "-val").textContent = val;
+  // Update total
+  const m = parseFloat(document.getElementById("w-mandatory").value);
+  const s = parseFloat(document.getElementById("w-skill-exp").value);
+  const d = parseFloat(document.getElementById("w-domain").value);
+  const e = parseFloat(document.getElementById("w-experience").value);
+  const total = (m + s + d + e).toFixed(2);
+  const totalEl = document.getElementById("w-total");
+  totalEl.textContent = total;
+  totalEl.style.color = Math.abs(parseFloat(total) - 1.0) < 0.001 ? "var(--success)" : "var(--danger)";
+}
+
+async function runSearch() {
+  const idx = document.getElementById("search-index").value;
+  if (!idx) { setStatus("search-status", "⚠ Select an index first.", "warn"); return; }
+
+  const topN    = parseInt(document.getElementById("search-topn").value) || 20;
+  const explain = parseInt(document.getElementById("search-explain").value) || 5;
+  const weights = {
+    mandatory:  parseFloat(document.getElementById("w-mandatory").value),
+    skill_exp:  parseFloat(document.getElementById("w-skill-exp").value),
+    domain:     parseFloat(document.getElementById("w-domain").value),
+    experience: parseFloat(document.getElementById("w-experience").value),
+  };
+
+  const btn = document.getElementById("btn-search");
+  const embedModel = document.getElementById("search-embed-model").value;
+  setBtnLoading(btn, true);
+  setStatus("search-status", `Searching with ${embedModel}… (LLM extraction + FAISS + scoring + explanations)`, "");
+
+  try {
+    let data;
+    if (searchMode === "text") {
+      const text = document.getElementById("req-text").value.trim();
+      if (!text) { setStatus("search-status", "⚠ Enter requirement text.", "warn"); return; }
+      data = await apiFetch("/api/skill-mapping/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requirement_text: text,
+          index_name: idx,
+          weights, top_n: topN, explain_top: explain,
+          embedding_model: embedModel,
+        }),
+      });
+    } else {
+      const fileInput = document.getElementById("req-file");
+      if (!fileInput.files.length) { setStatus("search-status", "⚠ Select a .txt file.", "warn"); return; }
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+      formData.append("index_name", idx);
+      formData.append("top_n", topN);
+      formData.append("explain_top", explain);
+      formData.append("weight_mandatory", weights.mandatory);
+      formData.append("weight_skill_exp", weights.skill_exp);
+      formData.append("weight_domain", weights.domain);
+      formData.append("weight_experience", weights.experience);
+      formData.append("embedding_model", embedModel);
+      data = await apiFetch("/api/skill-mapping/search-file", {
+        method: "POST",
+        body: formData,
+      });
+    }
+    renderResults(data);
+    setStatus("search-status", `✔ Search complete — ${data.total_matches} matches in ${data.search_latency_sec}s`, "ok");
+  } catch (e) {
+    setStatus("search-status", `✖ ${e.message}`, "err");
+  } finally {
+    setBtnLoading(btn, false);
+  }
+}
+
+// ── 5. Render Results ────────────────────────────────────────────────────
+
+function renderResults(data) {
+  document.getElementById("results-card").style.display = "";
+  document.getElementById("res-latency").textContent = data.search_latency_sec + "s";
+  document.getElementById("res-total").textContent   = data.total_matches;
+
+  // Metadata
+  document.getElementById("res-metadata").textContent =
+    JSON.stringify(data.extracted_metadata, null, 2);
+
+  // Display / embedding text
+  document.getElementById("res-display-text").textContent =
+    (data.display_text || "") + "\n\n── Embedding Text ──\n" + (data.embedding_text || "");
+
+  // Table
+  lastResults = data.results || [];
+  const tbody = document.getElementById("results-tbody");
+  tbody.innerHTML = lastResults.map((r, i) => {
+    const confClass = r.confidence === "High" ? "conf-high"
+                    : r.confidence === "Medium" ? "conf-medium" : "conf-low";
+    const skills = (r.skills || []).slice(0, 5).join(", ")
+                 + (r.skills && r.skills.length > 5 ? ` +${r.skills.length - 5}` : "");
+    return `<tr>
+      <td>${i + 1}</td>
+      <td>${r.employee_id}</td>
+      <td>${r.employee_name}</td>
+      <td>${r.domain}</td>
+      <td>${r.total_experience_years} yrs</td>
+      <td>${r.current_bandwidth_percent}%</td>
+      <td title="${(r.skills||[]).join(', ')}">${skills}</td>
+      <td>${r.similarity}</td>
+      <td>${r.rule_score}</td>
+      <td><strong>${r.final_rank}</strong></td>
+      <td class="${confClass}">${r.confidence}</td>
+      <td>
+        ${r.explanation
+          ? `<button class="btn btn-sm btn-primary" onclick="showExplanation(${i})">View</button>`
+          : '<span style="color:var(--muted)">—</span>'}
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+// ── Modal ────────────────────────────────────────────────────────────────
+
+function showExplanation(idx) {
+  const r = lastResults[idx];
+  document.getElementById("modal-title").textContent =
+    `${r.employee_name} (${r.employee_id}) — Final Rank: ${r.final_rank}`;
+  document.getElementById("modal-body").textContent = r.explanation || "No explanation available.";
+  document.getElementById("modal-overlay").classList.add("active");
+}
+
+function closeModal(e) {
+  if (e.target === document.getElementById("modal-overlay")) {
+    document.getElementById("modal-overlay").classList.remove("active");
+  }
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") document.getElementById("modal-overlay").classList.remove("active");
+});
+
+</script>
+</body>
+</html>
+*************************************************************************************************
+
+requirements.txt
+----------------------
+
+# ── Core API framework ──
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pydantic>=2.0
+
+# ── Environment / Config ──
+python-dotenv>=1.0.0
+
+# ── Data & ML ──
+numpy>=1.26.0
+pandas>=2.1.0
+openpyxl>=3.1.0
+faiss-cpu>=1.7.4
+scikit-learn>=1.3.0
+sentence-transformers>=2.2.0
+
+# ── HTTP client (for LLM & Embedding API calls) ──
+requests>=2.31.0
