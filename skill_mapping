@@ -1,1 +1,533 @@
-skill_mapping
+"""
+main.py — FastAPI application for Skill Mapping
+=================================================
+Accepts POST requests from any frontend (React, etc.) with either:
+  • JSON body containing requirement text, OR
+  • Multipart form with an uploaded file attachment
+
+Run:
+    uvicorn main:app --reload --port 8000
+
+Swagger UI:
+    http://localhost:8000/docs
+
+Endpoints:
+    GET  /api/health                         — health check
+    POST /api/employees/upload               — upload employee Excel/CSV
+    POST /api/embeddings/generate            — generate embeddings
+    POST /api/indexes                        — create a FAISS index
+    GET  /api/indexes                        — list available indexes
+    POST /api/indexes/{name}/append          — append to an existing index
+    DELETE /api/indexes/{name}               — delete an index
+    POST /api/skill-mapping/search           — text-based search (JSON body)
+    POST /api/skill-mapping/search-file      — file-based search (multipart form)
+"""
+
+import os
+import asyncio
+import threading
+from typing import Optional, List
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from skill_mapping_backend import (
+    load_employee_data,
+    generate_embeddings_incremental,
+    get_employee_dataframe,
+    create_index,
+    append_to_index,
+    delete_index,
+    list_indexes,
+    list_npy_files,
+    skill_mapping_search,
+    get_embedding_progress,
+    _update_progress,
+    embedding_progress,
+)
+
+# ── App setup ───────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Skill Mapping API",
+    description="Enterprise employee–requirement matching API. "
+                "Accepts free-text or file-based project requirements and "
+                "returns ranked employee matches with LLM explanations.",
+    version="1.0.0",
+)
+
+# Allow all origins so any React / frontend can call this API.
+# Tighten in production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Pydantic schemas ───────────────────────────────────────────────────────
+
+class WeightsSchema(BaseModel):
+    mandatory: float = Field(0.4, ge=0.0, le=1.0)
+    skill_exp: float = Field(0.3, ge=0.0, le=1.0)
+    domain: float = Field(0.2, ge=0.0, le=1.0)
+    experience: float = Field(0.1, ge=0.0, le=1.0)
+
+
+class SearchRequestBody(BaseModel):
+    """JSON body for text-based search."""
+    requirement_text: str
+    index_name: str
+    weights: Optional[WeightsSchema] = None
+    top_n: int = Field(20, ge=1, le=100)
+    explain_top: int = Field(10, ge=0, le=50)
+    embedding_model: str = Field("text-embedding-3-large", description="Embedding model: text-embedding-3-large or all-MiniLM-L6-v2")
+
+
+class IndexCreateRequest(BaseModel):
+    index_name: str
+    index_type: str = "flat"
+    nlist: int = 20
+    nprobe: int = 10
+    m: int = 16
+    ef_search: int = 32
+    embeddings_npy_filename: str = "employee_embeddings.npy"
+
+
+# ── Health check ────────────────────────────────────────────────────────────
+# React Usage:
+#   const res = await fetch("http://localhost:8000/api/health");
+#   const data = await res.json();   // { status: "ok" }
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
+# ── Employee data upload ────────────────────────────────────────────────────
+# React Usage (file input + FormData):
+#
+#   const formData = new FormData();
+#   formData.append("file", fileInputRef.current.files[0]);
+#   // Optional: formData.append("sheet_name", "Sheet1");
+#
+#   const res = await fetch("http://localhost:8000/api/employees/upload", {
+#     method: "POST",
+#     body: formData,
+#     // NOTE: Do NOT set Content-Type header — browser sets it with boundary
+#   });
+#   const data = await res.json();   // { status: "ok", rows_loaded: 1200 }
+#
+# Axios:
+#   const { data } = await axios.post(
+#     "http://localhost:8000/api/employees/upload",
+#     formData,
+#     { headers: { "Content-Type": "multipart/form-data" } }
+#   );
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/employees/upload")
+async def upload_employees(
+    file: UploadFile = File(...),
+    sheet_name: Optional[str] = Form(None),
+):
+    """Upload an employee Excel/CSV file."""
+    allowed = (".xlsx", ".csv")
+    if not file.filename.lower().endswith(allowed):
+        raise HTTPException(400, f"File must be one of {allowed}")
+
+    file_bytes = await file.read()
+    try:
+        df = load_employee_data(
+            file_bytes=file_bytes,
+            file_name=file.filename,
+            sheet_name=sheet_name,
+        )
+        return {"status": "ok", "rows_loaded": len(df)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Embedding generation ───────────────────────────────────────────────────
+# React Usage:
+#
+#   // Step 1: Kick off generation (returns immediately)
+#   const res = await fetch("http://localhost:8000/api/embeddings/generate", {
+#     method: "POST",
+#   });
+#   const data = await res.json();   // { status: "started", message: "..." }
+#
+#   // Step 2: Poll progress until phase === "done" or "error"
+#   const poll = setInterval(async () => {
+#     const p = await (await fetch("http://localhost:8000/api/embeddings/progress")).json();
+#     console.log(p.current, "/", p.total, p.message);
+#     if (!p.running) clearInterval(poll);
+#   }, 1000);
+#
+#   // Step 3: Fetch the final result once done
+#   const final = await (await fetch("http://localhost:8000/api/embeddings/result")).json();
+# ────────────────────────────────────────────────────────────────────────────
+
+# Thread-safe store for the final result of the last generation run
+_generation_result_lock = threading.Lock()
+_generation_result: dict = {}
+_generation_params: dict = {}  # stores embedding_model and npy filename for background thread
+
+def _run_generation_in_thread():
+    """Run generate_embeddings_incremental in a background thread."""
+    global _generation_result
+    try:
+        df = get_employee_dataframe()
+        result = generate_embeddings_incremental(
+            df,
+            embedding_model=_generation_params.get("embedding_model", "text-embedding-3-large"),
+            embeddings_npy_filename=_generation_params.get("embeddings_npy_filename", "employee_embeddings.npy"),
+        )
+        result.pop("vectors", None)
+        with _generation_result_lock:
+            _generation_result = result
+    except Exception as e:
+        _update_progress(running=False, phase="error", message=str(e))
+        with _generation_result_lock:
+            _generation_result = {"status": "error", "message": str(e)}
+
+
+@app.post("/api/embeddings/generate")
+async def generate_embeddings(
+    embedding_model: str = Query("text-embedding-3-large", description="Embedding model: text-embedding-3-large or all-MiniLM-L6-v2"),
+    embeddings_npy_filename: str = Query("employee_embeddings.npy", description="Output .npy filename for embeddings"),
+):
+    """
+    Kick off embedding generation in a background thread.
+
+    Query params:
+        embedding_model:         "text-embedding-3-large" (API) or "all-MiniLM-L6-v2" (local)
+        embeddings_npy_filename: Output .npy filename (e.g. "employee_embeddings_local.npy")
+
+    Returns immediately with { status: "started" }.
+    Poll GET /api/embeddings/progress for live progress,
+    then GET /api/embeddings/result for the final outcome.
+    """
+    # Check if already running
+    progress = get_embedding_progress()
+    if progress["running"]:
+        return {"status": "already_running", "message": "Embedding generation is already in progress.", **progress}
+
+    # Validate that employee data exists before kicking off
+    try:
+        get_employee_dataframe()
+    except FileNotFoundError as e:
+        raise HTTPException(400, str(e))
+
+    # Reset progress & result
+    _update_progress(
+        running=True, phase="starting", current=0, total=0,
+        current_employee_id="", message=f"Starting embedding generation ({embedding_model})…",
+    )
+    with _generation_result_lock:
+        global _generation_result, _generation_params
+        _generation_result = {}
+        _generation_params = {
+            "embedding_model": embedding_model,
+            "embeddings_npy_filename": embeddings_npy_filename,
+        }
+
+    # Launch in background thread
+    thread = threading.Thread(target=_run_generation_in_thread, daemon=True)
+    thread.start()
+
+    return {"status": "started", "message": "Embedding generation started. Poll /api/embeddings/progress for updates."}
+
+
+@app.get("/api/embeddings/progress")
+async def embeddings_progress():
+    """
+    Poll this endpoint to track live embedding generation progress.
+
+    Returns:
+        { running, phase, current, total, current_employee_id, message }
+
+    React Usage:
+        const p = await (await fetch("http://localhost:8000/api/embeddings/progress")).json();
+    """
+    return get_embedding_progress()
+
+
+@app.get("/api/embeddings/result")
+async def embeddings_result():
+    """
+    Fetch the final result of the last embedding generation run.
+
+    Returns the same dict as the old synchronous endpoint:
+        { status, new_count, deleted_count, reactivated_count,
+          total_active, rebuild_indexes_required }
+
+    React Usage:
+        const r = await (await fetch("http://localhost:8000/api/embeddings/result")).json();
+    """
+    with _generation_result_lock:
+        if not _generation_result:
+            return {"status": "no_result", "message": "No generation has completed yet. Run POST /api/embeddings/generate first."}
+        return dict(_generation_result)
+
+
+# ── Index management ───────────────────────────────────────────────────────
+#
+# ▸ POST  /api/indexes              — Create a new FAISS index
+# ▸ GET   /api/indexes              — List all available indexes
+# ▸ POST  /api/indexes/{name}/append — Append new vectors to an existing index
+# ▸ DELETE /api/indexes/{name}       — Delete an index
+#
+# ---- React Usage: CREATE INDEX (POST /api/indexes) ----
+#
+#   const res = await fetch("http://localhost:8000/api/indexes", {
+#     method: "POST",
+#     headers: { "Content-Type": "application/json" },
+#     body: JSON.stringify({
+#       index_name: "my_index",
+#       index_type: "flat",       // "flat" | "ivf" | "hnsw" | "ivf_hnsw"
+#       nlist: 20,                // IVF clusters  (used by ivf, ivf_hnsw)
+#       nprobe: 10,               // IVF search depth
+#       m: 16,                    // HNSW links    (used by hnsw, ivf_hnsw)
+#       ef_search: 32,            // HNSW search depth
+#     }),
+#   });
+#   const data = await res.json();
+#   // { status: "ok", index_name: "my_index", vector_count: 150 }
+#
+# Axios:
+#   const { data } = await axios.post("http://localhost:8000/api/indexes", {
+#     index_name: "my_index",
+#     index_type: "flat",
+#   });
+#
+# ---- React Usage: LIST INDEXES (GET /api/indexes) ----
+#
+#   const res = await fetch("http://localhost:8000/api/indexes");
+#   const data = await res.json();   // { indexes: ["my_index", "hnsw_v2"] }
+#
+# Axios:
+#   const { data } = await axios.get("http://localhost:8000/api/indexes");
+#
+# ---- React Usage: APPEND TO INDEX (POST /api/indexes/{name}/append) ----
+#
+#   // Normal append (new employees only):
+#   const indexName = "my_index";
+#   const res = await fetch(
+#     `http://localhost:8000/api/indexes/${indexName}/append`,
+#     { method: "POST" }
+#   );
+#   const data = await res.json();
+#   // { status: "ok", appended: 25, total: 175 }
+#
+#   // Full rebuild (after employees were deleted — removes stale vectors):
+#   const rebuildRes = await fetch(
+#     `http://localhost:8000/api/indexes/${indexName}/append?rebuild=true`,
+#     { method: "POST" }
+#   );
+#   const rebuildData = await rebuildRes.json();
+#   // { status: "ok", index_name: "my_index", vector_count: 150 }
+#
+# ---- React Usage: DELETE INDEX (DELETE /api/indexes/{name}) ----
+#
+#   const indexName = "my_index";
+#   const res = await fetch(
+#     `http://localhost:8000/api/indexes/${indexName}`,
+#     { method: "DELETE" }
+#   );
+#   const data = await res.json();   // { status: "ok" }
+#
+# Axios:
+#   await axios.delete(`http://localhost:8000/api/indexes/${indexName}`);
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/indexes")
+async def create_new_index(body: IndexCreateRequest):
+    result = create_index(
+        index_name=body.index_name,
+        index_type=body.index_type,
+        nlist=body.nlist,
+        nprobe=body.nprobe,
+        m=body.m,
+        ef_search=body.ef_search,
+        embeddings_npy_filename=body.embeddings_npy_filename,
+    )
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/api/indexes/{name}/append")
+async def append_index(name: str, rebuild: bool = Query(False, description="Set True to rebuild the index from scratch (e.g. after employee deletions)")):
+    result = append_to_index(name, rebuild=rebuild)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.delete("/api/indexes/{name}")
+async def remove_index(name: str):
+    result = delete_index(name)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+@app.get("/api/indexes")
+async def get_indexes():
+    return {"indexes": list_indexes()}
+
+
+@app.get("/api/embeddings/npy-files")
+async def get_npy_files():
+    """List all .npy embedding files available in the workspace."""
+    return {"npy_files": list_npy_files()}
+
+
+# ── Skill Mapping Search ───────────────────────────────────────────────────
+#
+# Two endpoints are available — choose based on input type:
+#
+# ▸ POST /api/skill-mapping/search       — JSON body (requirement as text)
+# ▸ POST /api/skill-mapping/search-file  — Multipart form (requirement as .txt file)
+#
+# ---- React Usage: TEXT SEARCH (POST /api/skill-mapping/search) ----
+#
+#   const res = await fetch("http://localhost:8000/api/skill-mapping/search", {
+#     method: "POST",
+#     headers: { "Content-Type": "application/json" },
+#     body: JSON.stringify({
+#       requirement_text: "Need 3 Python developers with AWS experience...",
+#       index_name: "my_index",
+#       top_n: 20,
+#       explain_top: 10,
+#       weights: {                  // optional — defaults shown
+#         mandatory: 0.4,
+#         skill_exp: 0.3,
+#         domain: 0.2,
+#         experience: 0.1,
+#       },
+#     }),
+#   });
+#   const data = await res.json();
+#   // {
+#   //   extracted_metadata: { domain: [...], mandatory_skills: [...], ... },
+#   //   display_text: "...",
+#   //   embedding_text: "...",
+#   //   search_latency_sec: 0.012,
+#   //   total_matches: 42,
+#   //   results: [
+#   //     {
+#   //       employee_id: "EMP001",
+#   //       employee_name: "John Doe",
+#   //       domain: "Finance",
+#   //       total_experience_years: 8.5,
+#   //       current_bandwidth_percent: 60,
+#   //       skills: ["Python", "AWS", "SQL"],
+#   //       similarity: 0.8723,
+#   //       rule_score: 84.40,
+#   //       calibrated_rule_score: 0.844,
+#   //       final_rank: 0.8610,
+#   //       confidence: "High",
+#   //       explanation: "1. Executive Fit Summary ..."   // only for top explain_top
+#   //     },
+#   //     ...
+#   //   ]
+#   // }
+#
+# Axios:
+#   const { data } = await axios.post("http://localhost:8000/api/skill-mapping/search", {
+#     requirement_text: "Need 3 Python developers...",
+#     index_name: "my_index",
+#   });
+#
+# ---- React Usage: FILE SEARCH (POST /api/skill-mapping/search-file) ----
+#
+#   const formData = new FormData();
+#   formData.append("file", fileInputRef.current.files[0]);  // .txt file
+#   formData.append("index_name", "my_index");
+#   formData.append("top_n", "20");
+#   formData.append("explain_top", "10");
+#   formData.append("weight_mandatory", "0.4");
+#   formData.append("weight_skill_exp", "0.3");
+#   formData.append("weight_domain", "0.2");
+#   formData.append("weight_experience", "0.1");
+#
+#   const res = await fetch("http://localhost:8000/api/skill-mapping/search-file", {
+#     method: "POST",
+#     body: formData,
+#     // NOTE: Do NOT set Content-Type header — browser sets it with boundary
+#   });
+#   const data = await res.json();   // same response shape as /search
+#
+# Axios:
+#   const { data } = await axios.post(
+#     "http://localhost:8000/api/skill-mapping/search-file",
+#     formData,
+#     { headers: { "Content-Type": "multipart/form-data" } }
+#   );
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/skill-mapping/search")
+async def search_with_json(body: SearchRequestBody):
+    """
+    Search using a JSON body with requirement_text.
+    """
+    weights = body.weights.model_dump() if body.weights else None
+    result = skill_mapping_search(
+        requirement_text=body.requirement_text,
+        index_name=body.index_name,
+        weights=weights,
+        top_n=body.top_n,
+        explain_top=body.explain_top,
+        embedding_model=body.embedding_model,
+    )
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/api/skill-mapping/search-file")
+async def search_with_file(
+    file: UploadFile = File(...),
+    index_name: str = Form(...),
+    top_n: int = Form(20),
+    explain_top: int = Form(10),
+    weight_mandatory: float = Form(0.4),
+    weight_skill_exp: float = Form(0.3),
+    weight_domain: float = Form(0.2),
+    weight_experience: float = Form(0.1),
+    embedding_model: str = Form("text-embedding-3-large"),
+):
+    """
+    Search by uploading a requirement text file (.txt).
+    Weights and parameters are passed as form fields.
+    """
+    if not file.filename.lower().endswith(".txt"):
+        raise HTTPException(400, "Only .txt files are accepted for requirement upload.")
+
+    file_bytes = await file.read()
+    requirement_text = file_bytes.decode("utf-8")
+
+    weights = {
+        "mandatory": weight_mandatory,
+        "skill_exp": weight_skill_exp,
+        "domain": weight_domain,
+        "experience": weight_experience,
+    }
+
+    result = skill_mapping_search(
+        requirement_text=requirement_text,
+        index_name=index_name,
+        weights=weights,
+        top_n=top_n,
+        explain_top=explain_top,
+        embedding_model=embedding_model,
+    )
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
