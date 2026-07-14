@@ -38,3 +38,11 @@ Overview : The proposed AI tool automates the comparison of existing bookmarked 
 Tech Stack:
 Text Extraction/Embeddings/Summarization(Open AI-GPT-4o) 
 User Interface (React)
+
+# Wait 60 seconds before connecting using these details, or login to https://console.neo4j.io to validate the Aura Instance is available
+NEO4J_URI=neo4j+s://93dcb14f.databases.neo4j.io
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=XVpj21AeixZsCkn2rdNleD9uHYSFp7rev8nMhlw4-dY
+NEO4J_DATABASE=neo4j
+AURA_INSTANCEID=93dcb14f
+AURA_INSTANCENAME=Free instance
